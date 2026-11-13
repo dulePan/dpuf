@@ -73,6 +73,19 @@ static __forceinline void engine_barrier(DpufSpinBarrier* bar, int32_t n_threads
 #endif
 }
 
+#define DPUF_MAX_SLOTS 8
+
+typedef struct {
+    float*  k_cache;
+    float*  v_cache;
+    int8_t* k_cache_q8;
+    int8_t* v_cache_q8;
+    float*  k_scale_q8;
+    float*  v_scale_q8;
+    int32_t cur_pos;
+    int     is_allocated;
+} DpufKvSlot;
+
 typedef struct {
     DpufModelConfig cfg;
     DpufLayerWeights* layers;
@@ -84,7 +97,12 @@ typedef struct {
     float* cos_tab;
     float* sin_tab;
 
-    /* Persistent KV Cache [num_layers, num_kv_heads, max_seq_len, head_dim] (contiguous over pos) */
+    /* Multi-Session KV Cache Slots */
+    DpufKvSlot slots[DPUF_MAX_SLOTS];
+    int32_t    n_slots;
+    int32_t    active_slot;
+
+    /* Active slot pointers [num_layers, num_kv_heads, max_seq_len, head_dim] (contiguous over pos) */
     float*  k_cache;
     float*  v_cache;
     int8_t* k_cache_q8;
@@ -1127,6 +1145,32 @@ static void run_multi_weights_dynamic(
 #endif
 }
 
+static int slot_allocate(DpufEngine* eng, int32_t s) {
+    if (s < 0 || s >= DPUF_MAX_SLOTS) return 0;
+    if (eng->slots[s].is_allocated) return 1;
+
+    size_t kv_elems = (size_t)eng->cfg.num_layers * (size_t)eng->cfg.max_seq_len *
+                      (size_t)(eng->cfg.num_kv_heads * eng->cfg.head_dim);
+    size_t kv_scale_elems = (size_t)eng->cfg.num_layers * (size_t)eng->cfg.max_seq_len *
+                            (size_t)((eng->cfg.num_kv_heads * eng->cfg.head_dim) >> 5);
+
+    if (eng->cfg.kv_type == DPUF_KV_Q8) {
+        eng->slots[s].k_cache_q8 = (int8_t*)calloc(kv_elems, sizeof(int8_t));
+        eng->slots[s].v_cache_q8 = (int8_t*)calloc(kv_elems, sizeof(int8_t));
+        eng->slots[s].k_scale_q8 = (float*)calloc(kv_scale_elems, sizeof(float));
+        eng->slots[s].v_scale_q8 = (float*)calloc(kv_scale_elems, sizeof(float));
+        if (!eng->slots[s].k_cache_q8 || !eng->slots[s].v_cache_q8 ||
+            !eng->slots[s].k_scale_q8 || !eng->slots[s].v_scale_q8) return 0;
+    } else {
+        eng->slots[s].k_cache = (float*)calloc(kv_elems, sizeof(float));
+        eng->slots[s].v_cache = (float*)calloc(kv_elems, sizeof(float));
+        if (!eng->slots[s].k_cache || !eng->slots[s].v_cache) return 0;
+    }
+    eng->slots[s].cur_pos = 0;
+    eng->slots[s].is_allocated = 1;
+    return 1;
+}
+
 DPUF_EXPORT void* dpuf_engine_create(
     const DpufModelConfig* cfg,
     const DpufLayerWeights* layers,
@@ -1169,17 +1213,16 @@ DPUF_EXPORT void* dpuf_engine_create(
     eng->cos_tab = (float*)malloc((size_t)max_seq * (size_t)(cfg->head_dim >> 1) * sizeof(float));
     eng->sin_tab = (float*)malloc((size_t)max_seq * (size_t)(cfg->head_dim >> 1) * sizeof(float));
 
-    int kv_ok = 1;
-    if (cfg->kv_type == DPUF_KV_Q8) {
-        eng->k_cache_q8 = (int8_t*)calloc(kv_elems, sizeof(int8_t));
-        eng->v_cache_q8 = (int8_t*)calloc(kv_elems, sizeof(int8_t));
-        eng->k_scale_q8 = (float*)calloc(kv_scale_elems, sizeof(float));
-        eng->v_scale_q8 = (float*)calloc(kv_scale_elems, sizeof(float));
-        kv_ok = eng->k_cache_q8 && eng->v_cache_q8 && eng->k_scale_q8 && eng->v_scale_q8;
-    } else {
-        eng->k_cache = (float*)calloc(kv_elems, sizeof(float));
-        eng->v_cache = (float*)calloc(kv_elems, sizeof(float));
-        kv_ok = eng->k_cache && eng->v_cache;
+    eng->n_slots = DPUF_MAX_SLOTS;
+    eng->active_slot = 0;
+    int kv_ok = slot_allocate(eng, 0);
+    if (kv_ok) {
+        eng->k_cache     = eng->slots[0].k_cache;
+        eng->v_cache     = eng->slots[0].v_cache;
+        eng->k_cache_q8  = eng->slots[0].k_cache_q8;
+        eng->v_cache_q8  = eng->slots[0].v_cache_q8;
+        eng->k_scale_q8  = eng->slots[0].k_scale_q8;
+        eng->v_scale_q8  = eng->slots[0].v_scale_q8;
     }
 
     eng->h_buf      = (float*)malloc((size_t)B * (size_t)h * sizeof(float));
@@ -1213,9 +1256,14 @@ DPUF_EXPORT void* dpuf_engine_create(
 
     if (!ok) {
         free(eng->cos_tab); free(eng->sin_tab);
-        free(eng->k_cache); free(eng->v_cache);
-        free(eng->k_cache_q8); free(eng->v_cache_q8);
-        free(eng->k_scale_q8); free(eng->v_scale_q8);
+        for (int s = 0; s < DPUF_MAX_SLOTS; s++) {
+            if (eng->slots[s].is_allocated) {
+                free(eng->slots[s].k_cache); free(eng->slots[s].v_cache);
+                free(eng->slots[s].k_cache_q8); free(eng->slots[s].v_cache_q8);
+                free(eng->slots[s].k_scale_q8); free(eng->slots[s].v_scale_q8);
+                eng->slots[s].is_allocated = 0;
+            }
+        }
         free(eng->h_buf); free(eng->hn_buf); free(eng->q_buf); free(eng->k_buf); free(eng->v_buf);
         free(eng->attn_out); free(eng->gate_buf); free(eng->up_buf); free(eng->ffn_hidden);
         free(eng->attn_scores); free(eng->layer_share_kv); free(eng->layer_share_gu);
@@ -1277,12 +1325,17 @@ DPUF_EXPORT void dpuf_engine_destroy(void* handle) {
     free((void*)eng->work_ctr);
     free(eng->cos_tab);
     free(eng->sin_tab);
-    free(eng->k_cache);
-    free(eng->v_cache);
-    free(eng->k_cache_q8);
-    free(eng->v_cache_q8);
-    free(eng->k_scale_q8);
-    free(eng->v_scale_q8);
+    for (int s = 0; s < DPUF_MAX_SLOTS; s++) {
+        if (eng->slots[s].is_allocated) {
+            free(eng->slots[s].k_cache);
+            free(eng->slots[s].v_cache);
+            free(eng->slots[s].k_cache_q8);
+            free(eng->slots[s].v_cache_q8);
+            free(eng->slots[s].k_scale_q8);
+            free(eng->slots[s].v_scale_q8);
+            eng->slots[s].is_allocated = 0;
+        }
+    }
     free(eng->h_buf);
     free(eng->hn_buf);
     free(eng->q_buf);
@@ -1305,21 +1358,70 @@ DPUF_EXPORT void dpuf_engine_destroy(void* handle) {
     free(eng);
 }
 
+DPUF_EXPORT int32_t dpuf_engine_set_slot(void* handle, int32_t slot_id) {
+    DpufEngine* eng = (DpufEngine*)handle;
+    if (!eng || slot_id < 0 || slot_id >= eng->n_slots) return -1;
+    if (!eng->slots[slot_id].is_allocated) {
+        if (!slot_allocate(eng, slot_id)) return -2;
+    }
+    eng->active_slot = slot_id;
+    eng->k_cache     = eng->slots[slot_id].k_cache;
+    eng->v_cache     = eng->slots[slot_id].v_cache;
+    eng->k_cache_q8  = eng->slots[slot_id].k_cache_q8;
+    eng->v_cache_q8  = eng->slots[slot_id].v_cache_q8;
+    eng->k_scale_q8  = eng->slots[slot_id].k_scale_q8;
+    eng->v_scale_q8  = eng->slots[slot_id].v_scale_q8;
+    return 0;
+}
+
+DPUF_EXPORT int32_t dpuf_engine_get_slot(void* handle) {
+    DpufEngine* eng = (DpufEngine*)handle;
+    return eng ? eng->active_slot : 0;
+}
+
+DPUF_EXPORT int32_t dpuf_engine_num_slots(void* handle) {
+    DpufEngine* eng = (DpufEngine*)handle;
+    return eng ? eng->n_slots : 1;
+}
+
+DPUF_EXPORT void dpuf_engine_reset_slot(void* handle, int32_t slot_id) {
+    DpufEngine* eng = (DpufEngine*)handle;
+    if (!eng || slot_id < 0 || slot_id >= eng->n_slots) return;
+    if (!eng->slots[slot_id].is_allocated) return;
+    size_t kv_elems = (size_t)eng->cfg.num_layers * (size_t)eng->cfg.max_seq_len *
+                      (size_t)(eng->cfg.num_kv_heads * eng->cfg.head_dim);
+    DpufKvSlot* sl = &eng->slots[slot_id];
+    sl->cur_pos = 0;
+    if (eng->cfg.kv_type == DPUF_KV_Q8) {
+        size_t kv_scale_elems = (size_t)eng->cfg.num_layers * (size_t)eng->cfg.max_seq_len *
+                                (size_t)((eng->cfg.num_kv_heads * eng->cfg.head_dim) >> 5);
+        if (sl->k_cache_q8) memset(sl->k_cache_q8, 0, kv_elems);
+        if (sl->v_cache_q8) memset(sl->v_cache_q8, 0, kv_elems);
+        if (sl->k_scale_q8) memset(sl->k_scale_q8, 0, kv_scale_elems * sizeof(float));
+        if (sl->v_scale_q8) memset(sl->v_scale_q8, 0, kv_scale_elems * sizeof(float));
+    } else {
+        if (sl->k_cache) memset(sl->k_cache, 0, kv_elems * sizeof(float));
+        if (sl->v_cache) memset(sl->v_cache, 0, kv_elems * sizeof(float));
+    }
+}
+
 DPUF_EXPORT void dpuf_engine_reset_cache(void* handle) {
     DpufEngine* eng = (DpufEngine*)handle;
     if (!eng) return;
+    dpuf_engine_reset_slot(handle, eng->active_slot);
+}
+
+DPUF_EXPORT size_t dpuf_engine_slot_memory(void* handle) {
+    DpufEngine* eng = (DpufEngine*)handle;
+    if (!eng) return 0;
     size_t kv_elems = (size_t)eng->cfg.num_layers * (size_t)eng->cfg.max_seq_len *
                       (size_t)(eng->cfg.num_kv_heads * eng->cfg.head_dim);
     if (eng->cfg.kv_type == DPUF_KV_Q8) {
         size_t kv_scale_elems = (size_t)eng->cfg.num_layers * (size_t)eng->cfg.max_seq_len *
                                 (size_t)((eng->cfg.num_kv_heads * eng->cfg.head_dim) >> 5);
-        if (eng->k_cache_q8) memset(eng->k_cache_q8, 0, kv_elems);
-        if (eng->v_cache_q8) memset(eng->v_cache_q8, 0, kv_elems);
-        if (eng->k_scale_q8) memset(eng->k_scale_q8, 0, kv_scale_elems * sizeof(float));
-        if (eng->v_scale_q8) memset(eng->v_scale_q8, 0, kv_scale_elems * sizeof(float));
+        return (2 * kv_elems * sizeof(int8_t)) + (2 * kv_scale_elems * sizeof(float));
     } else {
-        if (eng->k_cache) memset(eng->k_cache, 0, kv_elems * sizeof(float));
-        if (eng->v_cache) memset(eng->v_cache, 0, kv_elems * sizeof(float));
+        return 2 * kv_elems * sizeof(float);
     }
 }
 

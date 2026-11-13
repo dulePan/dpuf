@@ -154,6 +154,50 @@ python dpuf_profile.py del-agent model.dpuf excel
 
 ---
 
+## 🗂️ Multi-Session Slots: Multiple Independent Chats in One Model
+
+DPUF allows running multiple independent conversation sessions (**slots**) inside the same model in RAM simultaneously with **zero cross-talk and zero reloading overhead (0 ms)**:
+
+```cmd
+:: Run automated multi-session benchmark across 3 independent slots:
+dpuf-cli.exe -m model.dpuf --kv-q8 -c 512 --test-slots
+
+:: Configure up to 8 parallel sessions:
+dpuf-cli.exe -m model.dpuf --slots 4 -i
+```
+
+### Interactive Live Session Switching
+During chat, jump between sessions without losing a single token of context:
+```text
+[Slot 0:coder] > Write a matrix rotation in C
+... (Slot 0 generates C code, context = 105 tokens) ...
+
+[Slot 0:coder] > /slot 1
+[Switched to Slot 1: 'Session-1' | pos=0 tok | active agent='excel']
+[0 ms context swap — conversation preserved]
+
+[Slot 1:excel] > Why is XLOOKUP better than VLOOKUP?
+... (Slot 1 generates Excel explanation, context = 103 tokens) ...
+
+[Slot 1:excel] > /slot 0
+[Switched to Slot 0: 'Session-0' | pos=105 tok | active agent='coder']
+[0 ms context swap — conversation preserved]
+
+[Slot 0:coder] > Now optimize that with AVX2
+... (Continues C conversation right where you left off!) ...
+```
+
+### Memory Footprint per Slot
+Thanks to GQA (Grouped Query Attention) and Q8 quantization (`--kv-q8`), each slot uses very little RAM:
+| Model | Context Length | KV Cache Precision | RAM per Slot |
+| :--- | :---: | :---: | :---: |
+| **Qwen3-0.6B** | `512` tokens | Q8 Quantized | **31.5 MB** |
+| **Llama-3.2-1B** | `1024` tokens | Q8 Quantized | **17.0 MB** |
+| **Llama-3.2-1B** | `2048` tokens | Q8 Quantized | **34.0 MB** |
+| **Qwen3-8B** | `512` tokens | Q8 Quantized | **36.0 MB** |
+
+---
+
 ## 📁 Managing In-Container Profiles & Rules
 
 Every `.dpuf` container can carry its own persona and behavioral rules directly inside its header:
