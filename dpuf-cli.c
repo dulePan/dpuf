@@ -14,8 +14,21 @@
 #define _CRT_SECURE_NO_WARNINGS
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#pragma comment(lib, "ws2_32.lib")
+typedef SOCKET dpuf_socket_t;
+#define DPUF_INVALID_SOCKET INVALID_SOCKET
+#define DPUF_SOCKET_ERROR SOCKET_ERROR
+#define dpuf_closesocket closesocket
 #else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -23,6 +36,11 @@
 #include <dirent.h>
 #include <time.h>
 #include <strings.h>
+#include <signal.h>
+typedef int dpuf_socket_t;
+#define DPUF_INVALID_SOCKET (-1)
+#define DPUF_SOCKET_ERROR (-1)
+#define dpuf_closesocket close
 #endif
 #include <ctype.h>
 #include <math.h>
@@ -2764,6 +2782,8 @@ static void print_usage(const char* prog) {
     printf("  --verify-crc    Verify full file payload CRC32 on open\n");
     printf("  --tokens        Print encoded prompt token IDs\n");
     printf("  --bench         Run tg64 / pp32 / pp256 throughput benchmark\n");
+    printf("  --server [port] Start local OpenAI-compatible HTTP server (default: 8080)\n");
+    printf("  --host <ip>     HTTP server host bind address (default: 127.0.0.1)\n");
 }
 
 #ifndef _WIN32
@@ -2906,9 +2926,863 @@ static int resolve_or_select_model(const char* requested, char* out_path, size_t
     return 1;
 }
 
+/* ========================================================================= */
+/* DPUF Lightweight High-Performance OpenAI-Compatible HTTP Server           */
+/* ========================================================================= */
+
+static volatile int g_server_running = 1;
+
+#ifdef _WIN32
+static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
+    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+        g_server_running = 0;
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
+static void sigint_handler(int sig) {
+    (void)sig;
+    g_server_running = 0;
+}
+#endif
+
+static int init_sockets(void) {
+#ifdef _WIN32
+    WSADATA wsa;
+    return (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+#else
+    return 1;
+#endif
+}
+
+static void cleanup_sockets(void) {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+static int socket_send_all(dpuf_socket_t s, const char* data, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+#ifdef _WIN32
+        int n = send(s, data + total, (int)(len - total), 0);
+#else
+        int n = send(s, data + total, len - total, MSG_NOSIGNAL);
+#endif
+        if (n <= 0) return 0;
+        total += (size_t)n;
+    }
+    return 1;
+}
+
+static void send_http_headers(dpuf_socket_t s, int status_code, const char* status_text, const char* content_type, size_t content_length, int is_stream) {
+    char hbuf[1024];
+    int len;
+    if (is_stream) {
+        len = snprintf(hbuf, sizeof(hbuf),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-Slot-ID, X-Agent\r\n"
+            "\r\n",
+            status_code, status_text, content_type);
+    } else {
+        len = snprintf(hbuf, sizeof(hbuf),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-Slot-ID, X-Agent\r\n"
+            "\r\n",
+            status_code, status_text, content_type, content_length);
+    }
+    socket_send_all(s, hbuf, (size_t)len);
+}
+
+static void send_http_response(dpuf_socket_t s, int status_code, const char* status_text, const char* content_type, const char* body, size_t body_len) {
+    send_http_headers(s, status_code, status_text, content_type, body_len, 0);
+    if (body_len > 0 && body) {
+        socket_send_all(s, body, body_len);
+    }
+}
+
+/* JSON Parsing & Escaping Utilities */
+
+static void json_unescape_str(const char* src, size_t src_len, char* dst, size_t dst_max) {
+    size_t si = 0, di = 0;
+    while (si < src_len && di + 1 < dst_max) {
+        if (src[si] == '\\' && si + 1 < src_len) {
+            si++;
+            switch (src[si]) {
+                case '"':  dst[di++] = '"'; break;
+                case '\\': dst[di++] = '\\'; break;
+                case '/':  dst[di++] = '/'; break;
+                case 'b':  dst[di++] = '\b'; break;
+                case 'f':  dst[di++] = '\f'; break;
+                case 'n':  dst[di++] = '\n'; break;
+                case 'r':  dst[di++] = '\r'; break;
+                case 't':  dst[di++] = '\t'; break;
+                case 'u':
+                    if (si + 4 < src_len) {
+                        char hex[5] = { src[si+1], src[si+2], src[si+3], src[si+4], 0 };
+                        unsigned int cp = (unsigned int)strtoul(hex, NULL, 16);
+                        si += 4;
+                        if (cp < 0x80) {
+                            dst[di++] = (char)cp;
+                        } else if (cp < 0x800 && di + 2 < dst_max) {
+                            dst[di++] = (char)(0xC0 | (cp >> 6));
+                            dst[di++] = (char)(0x80 | (cp & 0x3F));
+                        } else if (di + 3 < dst_max) {
+                            dst[di++] = (char)(0xE0 | (cp >> 12));
+                            dst[di++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            dst[di++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    }
+                    break;
+                default: dst[di++] = src[si]; break;
+            }
+            si++;
+        } else {
+            dst[di++] = src[si++];
+        }
+    }
+    dst[di] = '\0';
+}
+
+static void json_escape_dynamic(const char* src, size_t src_len, StrBuf* out) {
+    out->len = 0;
+    for (size_t i = 0; i < src_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"') {
+            sb_append_bytes(out, "\\\"", 2);
+        } else if (c == '\\') {
+            sb_append_bytes(out, "\\\\", 2);
+        } else if (c == '\n') {
+            sb_append_bytes(out, "\\n", 2);
+        } else if (c == '\r') {
+            sb_append_bytes(out, "\\r", 2);
+        } else if (c == '\t') {
+            sb_append_bytes(out, "\\t", 2);
+        } else if (c < 0x20) {
+            char ubuf[8];
+            snprintf(ubuf, sizeof(ubuf), "\\u%04x", c);
+            sb_append_bytes(out, ubuf, 6);
+        } else {
+            sb_append_bytes(out, (const char*)&src[i], 1);
+        }
+    }
+}
+
+static void json_escape_fixed(const char* src, size_t src_len, char* dst, size_t max_dst) {
+    size_t di = 0;
+    for (size_t i = 0; i < src_len && di + 8 < max_dst; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"') {
+            dst[di++] = '\\'; dst[di++] = '"';
+        } else if (c == '\\') {
+            dst[di++] = '\\'; dst[di++] = '\\';
+        } else if (c == '\n') {
+            dst[di++] = '\\'; dst[di++] = 'n';
+        } else if (c == '\r') {
+            dst[di++] = '\\'; dst[di++] = 'r';
+        } else if (c == '\t') {
+            dst[di++] = '\\'; dst[di++] = 't';
+        } else if (c < 0x20) {
+            di += snprintf(dst + di, max_dst - di, "\\u%04x", c);
+        } else {
+            dst[di++] = (char)c;
+        }
+    }
+    dst[di] = '\0';
+}
+
+static const char* json_skip_whitespace(const char* p) {
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    return p;
+}
+
+static const char* json_find_field(const char* json, const char* key) {
+    size_t klen = strlen(key);
+    const char* p = json;
+    while ((p = strstr(p, key)) != NULL) {
+        if (p > json && *(p - 1) == '"' && *(p + klen) == '"') {
+            const char* after = json_skip_whitespace(p + klen + 1);
+            if (*after == ':') {
+                return json_skip_whitespace(after + 1);
+            }
+        }
+        p += klen;
+    }
+    return NULL;
+}
+
+static int json_extract_str_val(const char* val_start, char* out, size_t max_out) {
+    if (!val_start || *val_start != '"') return 0;
+    val_start++;
+    const char* p = val_start;
+    int esc = 0;
+    while (*p) {
+        if (esc) {
+            esc = 0;
+        } else if (*p == '\\') {
+            esc = 1;
+        } else if (*p == '"') {
+            break;
+        }
+        p++;
+    }
+    size_t raw_len = (size_t)(p - val_start);
+    json_unescape_str(val_start, raw_len, out, max_out);
+    return 1;
+}
+
+static char* json_extract_dyn_str(const char* val_start) {
+    if (!val_start || *val_start != '"') return NULL;
+    val_start++;
+    const char* p = val_start;
+    int esc = 0;
+    while (*p) {
+        if (esc) {
+            esc = 0;
+        } else if (*p == '\\') {
+            esc = 1;
+        } else if (*p == '"') {
+            break;
+        }
+        p++;
+    }
+    size_t raw_len = (size_t)(p - val_start);
+    char* buf = (char*)malloc(raw_len + 1);
+    if (!buf) return NULL;
+    json_unescape_str(val_start, raw_len, buf, raw_len + 1);
+    return buf;
+}
+
+typedef struct {
+    char role[32];
+    char* content;
+} HttpChatMessage;
+
+typedef struct {
+    char model[128];
+    HttpChatMessage messages[64];
+    int n_messages;
+    char prompt[16384];
+    int has_prompt;
+    int max_tokens;
+    float temperature;
+    int stream;
+    int slot_id;
+    char agent[64];
+} HttpRequestParams;
+
+static int parse_http_messages(const char* json, HttpRequestParams* req) {
+    req->n_messages = 0;
+    const char* p = json_find_field(json, "messages");
+    if (!p || *p != '[') return 0;
+    p++;
+    
+    while (*p && *p != ']' && req->n_messages < 64) {
+        p = json_skip_whitespace(p);
+        if (*p == '{') {
+            const char* obj_start = p;
+            int depth = 0;
+            int in_str = 0;
+            int esc = 0;
+            const char* obj_end = NULL;
+            while (*p) {
+                if (in_str) {
+                    if (esc) esc = 0;
+                    else if (*p == '\\') esc = 1;
+                    else if (*p == '"') in_str = 0;
+                } else {
+                    if (*p == '"') in_str = 1;
+                    else if (*p == '{') depth++;
+                    else if (*p == '}') {
+                        depth--;
+                        if (depth == 0) {
+                            obj_end = p;
+                            break;
+                        }
+                    }
+                }
+                p++;
+            }
+            if (obj_end) {
+                size_t olen = (size_t)(obj_end - obj_start + 1);
+                char* obj_str = (char*)malloc(olen + 1);
+                if (obj_str) {
+                    memcpy(obj_str, obj_start, olen);
+                    obj_str[olen] = '\0';
+
+                    HttpChatMessage* m = &req->messages[req->n_messages];
+                    m->role[0] = '\0';
+                    m->content = NULL;
+
+                    const char* rval = json_find_field(obj_str, "role");
+                    if (rval) json_extract_str_val(rval, m->role, sizeof(m->role));
+                    else snprintf(m->role, sizeof(m->role), "user");
+
+                    const char* cval = json_find_field(obj_str, "content");
+                    if (cval) m->content = json_extract_dyn_str(cval);
+
+                    if (m->content) {
+                        req->n_messages++;
+                    }
+                    free(obj_str);
+                }
+                p = obj_end + 1;
+            } else {
+                break;
+            }
+        } else if (*p == ']') {
+            break;
+        } else {
+            p++;
+        }
+    }
+    return req->n_messages;
+}
+
+static void parse_http_request_params(const char* body, HttpRequestParams* req) {
+    memset(req, 0, sizeof(*req));
+    req->max_tokens = 256;
+    req->temperature = 0.0f;
+    req->stream = 0;
+    req->slot_id = -1;
+
+    const char* mval = json_find_field(body, "model");
+    if (mval) json_extract_str_val(mval, req->model, sizeof(req->model));
+
+    const char* tval = json_find_field(body, "temperature");
+    if (tval) req->temperature = (float)atof(tval);
+
+    const char* mxval = json_find_field(body, "max_tokens");
+    if (mxval) req->max_tokens = atoi(mxval);
+
+    const char* sval = json_find_field(body, "stream");
+    if (sval) {
+        if (strncmp(sval, "true", 4) == 0) req->stream = 1;
+        else if (strncmp(sval, "false", 5) == 0) req->stream = 0;
+        else req->stream = atoi(sval) ? 1 : 0;
+    }
+
+    const char* slval = json_find_field(body, "slot");
+    if (slval) req->slot_id = atoi(slval);
+
+    const char* agval = json_find_field(body, "agent");
+    if (agval) json_extract_str_val(agval, req->agent, sizeof(req->agent));
+
+    const char* pval = json_find_field(body, "prompt");
+    if (pval) {
+        if (json_extract_str_val(pval, req->prompt, sizeof(req->prompt))) {
+            req->has_prompt = 1;
+        }
+    }
+
+    parse_http_messages(body, req);
+}
+
+static void free_http_request_params(HttpRequestParams* req) {
+    for (int i = 0; i < req->n_messages; i++) {
+        if (req->messages[i].content) {
+            free(req->messages[i].content);
+            req->messages[i].content = NULL;
+        }
+    }
+}
+
+static void handle_chat_completions(DpufCliModel* m, dpuf_socket_t client_sock, HttpRequestParams* req, const char* client_agent_hdr, int client_slot_hdr, int is_raw_completion) {
+    /* 1. Determine specialist agent */
+    char chosen_agent[64] = {0};
+    if (client_agent_hdr && client_agent_hdr[0]) {
+        snprintf(chosen_agent, sizeof(chosen_agent), "%s", client_agent_hdr);
+    } else if (req->agent[0]) {
+        snprintf(chosen_agent, sizeof(chosen_agent), "%s", req->agent);
+    } else if (req->model[0]) {
+        char* colon = strchr(req->model, ':');
+        if (colon) snprintf(chosen_agent, sizeof(chosen_agent), "%s", colon + 1);
+    }
+
+    int ag_idx = m->active_agent_idx;
+    if (chosen_agent[0]) {
+        for (int a = 0; a < m->n_agents; a++) {
+            if (_stricmp(m->agents[a].name, chosen_agent) == 0) {
+                ag_idx = a;
+                break;
+            }
+        }
+    }
+
+    /* 2. Determine target slot */
+    int target_slot = 0;
+    if (client_slot_hdr >= 0 && client_slot_hdr < m->n_session_slots) {
+        target_slot = client_slot_hdr;
+    } else if (req->slot_id >= 0 && req->slot_id < m->n_session_slots) {
+        target_slot = req->slot_id;
+    }
+
+    dpuf_engine_set_slot(m->engine, target_slot);
+    m->active_slot_idx = target_slot;
+
+    /* 3. Prepare slot & prefix cache */
+    int32_t start_pos = 0;
+    int use_cached_prefix = 0;
+    int start_turn_idx = 0;
+
+    int has_custom_system = 0;
+    if (!is_raw_completion && req->n_messages > 0 && strcmp(req->messages[0].role, "system") == 0) {
+        const char* sys_txt = req->messages[0].content;
+        const char* ag_sys = (ag_idx >= 0 && ag_idx < m->n_agents) ? m->agents[ag_idx].system_prompt : m->profile_system_prompt;
+        if (ag_sys && strcmp(sys_txt, ag_sys) == 0 && ag_idx >= 0 && ag_idx < MAX_DPOF_AGENTS && m->has_prefix[ag_idx]) {
+            start_turn_idx = 1;
+        } else {
+            has_custom_system = 1;
+        }
+    }
+
+    if (!is_raw_completion && !has_custom_system && ag_idx >= 0 && ag_idx < MAX_DPOF_AGENTS && m->has_prefix[ag_idx]) {
+        dpuf_engine_apply_prefix(m->engine, target_slot, ag_idx);
+        start_pos = m->prefix_len[ag_idx];
+        use_cached_prefix = 1;
+    } else {
+        dpuf_engine_reset_slot(m->engine, target_slot);
+        start_pos = 0;
+        use_cached_prefix = 0;
+    }
+
+    /* 4. Format prompt */
+    StrBuf prompt_buf = {0};
+    if (is_raw_completion || req->has_prompt) {
+        sb_append_bytes(&prompt_buf, req->prompt, strlen(req->prompt));
+    } else {
+        if (strcmp(m->tok.chat_format, "llama3") == 0) {
+            if (!use_cached_prefix) {
+                sb_append_bytes(&prompt_buf, "<|begin_of_text|>", 17);
+            }
+            for (int i = start_turn_idx; i < req->n_messages; i++) {
+                const char* r = req->messages[i].role;
+                const char* c = req->messages[i].content;
+                sb_append_bytes(&prompt_buf, "<|start_header_id|>", 19);
+                sb_append_bytes(&prompt_buf, r, strlen(r));
+                sb_append_bytes(&prompt_buf, "<|end_header_id|>\n\n", 19);
+                sb_append_bytes(&prompt_buf, c, strlen(c));
+                sb_append_bytes(&prompt_buf, "<|eot_id|>", 10);
+            }
+            sb_append_bytes(&prompt_buf, "<|start_header_id|>assistant<|end_header_id|>\n\n", 48);
+        } else {
+            /* ChatML (Qwen3) */
+            for (int i = start_turn_idx; i < req->n_messages; i++) {
+                const char* r = req->messages[i].role;
+                const char* c = req->messages[i].content;
+                sb_append_bytes(&prompt_buf, "<|im_start|>", 12);
+                sb_append_bytes(&prompt_buf, r, strlen(r));
+                sb_append_bytes(&prompt_buf, "\n", 1);
+                sb_append_bytes(&prompt_buf, c, strlen(c));
+                sb_append_bytes(&prompt_buf, "<|im_end|>\n", 11);
+            }
+            sb_append_bytes(&prompt_buf, "<|im_start|>assistant\n", 22);
+        }
+    }
+
+    IntVec ids = {0};
+    bpe_encode(&m->tok, prompt_buf.data ? prompt_buf.data : "", 0, &ids);
+    free(prompt_buf.data);
+
+    if (ids.len == 0) {
+        char err_buf[256];
+        snprintf(err_buf, sizeof(err_buf), "{\"error\":{\"message\":\"Empty prompt tokens\",\"type\":\"invalid_request_error\"}}");
+        send_http_response(client_sock, 400, "Bad Request", "application/json", err_buf, strlen(err_buf));
+        free(ids.ids);
+        return;
+    }
+
+    if (start_pos + ids.len >= m->cfg.max_seq_len) {
+        char err_buf[256];
+        snprintf(err_buf, sizeof(err_buf),
+            "{\"error\":{\"message\":\"Context limit reached: prompt %d + prefix %d >= max %d\",\"type\":\"invalid_request_error\"}}",
+            ids.len, start_pos, m->cfg.max_seq_len);
+        send_http_response(client_sock, 400, "Bad Request", "application/json", err_buf, strlen(err_buf));
+        free(ids.ids);
+        return;
+    }
+
+    /* 5. Pre-fill tokens */
+    float* logits = (float*)malloc((size_t)m->cfg.vocab_size * sizeof(float));
+    double t_pp = now_ms();
+    int32_t pos = start_pos;
+    for (int32_t off = 0; off < ids.len; off += 256) {
+        int32_t chunk = ids.len - off;
+        if (chunk > 256) chunk = 256;
+        int32_t is_last = (off + chunk == ids.len) ? 1 : 0;
+        int32_t rc = dpuf_engine_forward_batch(m->engine, chunk, ids.ids + off, pos, is_last ? 1 : 2, logits);
+        if (rc != 0) {
+            char err_buf[256];
+            snprintf(err_buf, sizeof(err_buf), "{\"error\":{\"message\":\"Engine forward error %d\",\"type\":\"internal_error\"}}", rc);
+            send_http_response(client_sock, 500, "Internal Server Error", "application/json", err_buf, strlen(err_buf));
+            free(ids.ids);
+            free(logits);
+            return;
+        }
+        pos += chunk;
+    }
+    double dt_pp = now_ms() - t_pp;
+
+    int32_t next_tok = sample_token(logits, m->cfg.vocab_size, req->temperature);
+    int32_t generated = 0;
+    char dec_buf[512];
+    char req_id[64];
+    time_t now_sec = time(NULL);
+    snprintf(req_id, sizeof(req_id), "chatcmpl-%08x%04x", (uint32_t)now_sec, (uint32_t)((uint64_t)now_ms() & 0xFFFF));
+    const char* resp_model = req->model[0] ? req->model : (m->model_name[0] ? m->model_name : "dpuf-model");
+
+    double t_tg = now_ms();
+
+    if (req->stream) {
+        send_http_headers(client_sock, 200, "OK", "text/event-stream; charset=utf-8", 0, 1);
+        char sse_chunk[2048];
+        char esc_buf[1024];
+
+        while (generated < req->max_tokens && pos < m->cfg.max_seq_len) {
+            if (bpe_is_eos(&m->tok, next_tok)) break;
+            size_t dn = bpe_decode_token(&m->tok, next_tok, dec_buf, sizeof(dec_buf));
+            if (dn > 0) {
+                dec_buf[dn] = '\0';
+                json_escape_fixed(dec_buf, dn, esc_buf, sizeof(esc_buf));
+                int slen;
+                if (is_raw_completion) {
+                    slen = snprintf(sse_chunk, sizeof(sse_chunk),
+                        "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,\"text\":\"%s\",\"finish_reason\":null}]}\n\n",
+                        req_id, (long)now_sec, resp_model, esc_buf);
+                } else {
+                    slen = snprintf(sse_chunk, sizeof(sse_chunk),
+                        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+                        req_id, (long)now_sec, resp_model, esc_buf);
+                }
+                if (!socket_send_all(client_sock, sse_chunk, (size_t)slen)) break;
+            }
+            dpuf_engine_forward_token(m->engine, next_tok, pos, logits);
+            pos++;
+            generated++;
+            next_tok = sample_token(logits, m->cfg.vocab_size, req->temperature);
+        }
+
+        int slen;
+        if (is_raw_completion) {
+            slen = snprintf(sse_chunk, sizeof(sse_chunk),
+                "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n"
+                "data: [DONE]\n\n",
+                req_id, (long)now_sec, resp_model);
+        } else {
+            slen = snprintf(sse_chunk, sizeof(sse_chunk),
+                "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                "data: [DONE]\n\n",
+                req_id, (long)now_sec, resp_model);
+        }
+        socket_send_all(client_sock, sse_chunk, (size_t)slen);
+    } else {
+        StrBuf out_text = {0};
+        while (generated < req->max_tokens && pos < m->cfg.max_seq_len) {
+            if (bpe_is_eos(&m->tok, next_tok)) break;
+            size_t dn = bpe_decode_token(&m->tok, next_tok, dec_buf, sizeof(dec_buf));
+            if (dn > 0) {
+                sb_append_bytes(&out_text, dec_buf, dn);
+            }
+            dpuf_engine_forward_token(m->engine, next_tok, pos, logits);
+            pos++;
+            generated++;
+            next_tok = sample_token(logits, m->cfg.vocab_size, req->temperature);
+        }
+
+        StrBuf esc_text = {0};
+        json_escape_dynamic(out_text.data ? out_text.data : "", out_text.len, &esc_text);
+
+        StrBuf json_resp = {0};
+        char header_meta[512];
+        if (is_raw_completion) {
+            snprintf(header_meta, sizeof(header_meta),
+                "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,\"text\":\"",
+                req_id, (long)now_sec, resp_model);
+        } else {
+            snprintf(header_meta, sizeof(header_meta),
+                "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"",
+                req_id, (long)now_sec, resp_model);
+        }
+        sb_append_bytes(&json_resp, header_meta, strlen(header_meta));
+        sb_append_bytes(&json_resp, esc_text.data ? esc_text.data : "", esc_text.len);
+
+        char footer_meta[512];
+        if (is_raw_completion) {
+            snprintf(footer_meta, sizeof(footer_meta),
+                "\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+                ids.len, generated, ids.len + generated);
+        } else {
+            snprintf(footer_meta, sizeof(footer_meta),
+                "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+                ids.len, generated, ids.len + generated);
+        }
+        sb_append_bytes(&json_resp, footer_meta, strlen(footer_meta));
+
+        send_http_response(client_sock, 200, "OK", "application/json; charset=utf-8", json_resp.data, json_resp.len);
+
+        free(out_text.data);
+        free(esc_text.data);
+        free(json_resp.data);
+    }
+
+    double dt_tg = now_ms() - t_tg;
+    double prompt_tps = (dt_pp > 0.0) ? (1000.0 * ids.len / dt_pp) : 0.0;
+    double gen_tps = (dt_tg > 0.0 && generated > 0) ? (1000.0 * generated / dt_tg) : 0.0;
+
+    const char* ag_name = (ag_idx >= 0 && ag_idx < m->n_agents) ? m->agents[ag_idx].name : "default";
+    printf("[server] %s -> slot:%d | agent:'%s' | stream:%d | prompt:%d tok (%.1f ms, %.1f tok/s) | gen:%d tok (%.1f ms, %.2f tok/s)\n",
+        is_raw_completion ? "POST /v1/completions" : "POST /v1/chat/completions",
+        target_slot, ag_name, req->stream, ids.len, dt_pp, prompt_tps, generated, dt_tg, gen_tps);
+
+    free(ids.ids);
+    free(logits);
+}
+
+static int run_http_server(DpufCliModel* m, const char* host, int port) {
+    if (!init_sockets()) {
+        fprintf(stderr, "[server error] Failed to initialize socket library\n");
+        return 1;
+    }
+
+#ifdef _WIN32
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+#else
+    signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
+    dpuf_socket_t srv_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (srv_sock == DPUF_INVALID_SOCKET) {
+        fprintf(stderr, "[server error] Failed to create socket\n");
+        cleanup_sockets();
+        return 1;
+    }
+
+    int opt = 1;
+#ifdef _WIN32
+    setsockopt(srv_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#else
+    setsockopt(srv_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+
+    struct sockaddr_in srv_addr;
+    memset(&srv_addr, 0, sizeof(srv_addr));
+    srv_addr.sin_family = AF_INET;
+    srv_addr.sin_port = htons((uint16_t)port);
+    if (strcmp(host, "0.0.0.0") == 0) {
+        srv_addr.sin_addr.s_addr = INADDR_ANY;
+    } else {
+        srv_addr.sin_addr.s_addr = inet_addr(host);
+        if (srv_addr.sin_addr.s_addr == INADDR_NONE) {
+            srv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        }
+    }
+
+    if (bind(srv_sock, (struct sockaddr*)&srv_addr, sizeof(srv_addr)) == DPUF_SOCKET_ERROR) {
+        fprintf(stderr, "[server error] Failed to bind to %s:%d (port may already be in use)\n", host, port);
+        dpuf_closesocket(srv_sock);
+        cleanup_sockets();
+        return 1;
+    }
+
+    if (listen(srv_sock, 32) == DPUF_SOCKET_ERROR) {
+        fprintf(stderr, "[server error] Failed to listen on socket\n");
+        dpuf_closesocket(srv_sock);
+        cleanup_sockets();
+        return 1;
+    }
+
+    size_t slot_bytes = dpuf_engine_slot_memory(m->engine);
+    double slot_mb = (double)slot_bytes / (1024.0 * 1024.0);
+
+    printf("\n========================================================================================\n");
+    printf(" DPUF High-Performance OpenAI-Compatible HTTP Server\n");
+    printf(" Active Model : %s (%s, %d layers, hidden=%d, kv=%s)\n",
+        m->model_name[0] ? m->model_name : "DPUF",
+        m->cfg.use_llama3_rope ? "llama3-rope" : "neox-rope",
+        m->cfg.num_layers, m->cfg.hidden_size,
+        m->cfg.kv_type == DPUF_KV_Q8 ? "Q8" : "FP32");
+    printf(" Listening on : http://%s:%d\n", host, port);
+    printf(" Endpoints    :\n");
+    printf("   GET  http://%s:%d/health              -> Health check & server diagnostics\n", host, port);
+    printf("   GET  http://%s:%d/v1/models           -> List registered models & specialist agents\n", host, port);
+    printf("   POST http://%s:%d/v1/chat/completions -> OpenAI chat completion (stream: true/false)\n", host, port);
+    printf("   POST http://%s:%d/v1/completions      -> OpenAI raw text completion\n", host, port);
+    printf(" Parallel Slots: %d slots (~%.2f MB hardware KV RAM per slot)\n", m->n_session_slots, slot_mb);
+    printf(" Agent Personas: %d specialists (Instant 0.05ms KV-Prefix Freeze & Fork primed)\n", m->n_agents);
+    printf(" Press Ctrl+C to stop server\n");
+    printf("========================================================================================\n\n");
+    fflush(stdout);
+
+    #define REQ_MAX_BUF (512 * 1024)
+    char* req_buf = (char*)malloc(REQ_MAX_BUF);
+    if (!req_buf) {
+        dpuf_closesocket(srv_sock);
+        cleanup_sockets();
+        return 1;
+    }
+
+    while (g_server_running) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(srv_sock, &read_fds);
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        int sel = select((int)srv_sock + 1, &read_fds, NULL, NULL, &tv);
+        if (sel <= 0) continue;
+
+        struct sockaddr_in client_addr;
+        int addr_len = sizeof(client_addr);
+#ifdef _WIN32
+        dpuf_socket_t client_sock = accept(srv_sock, (struct sockaddr*)&client_addr, &addr_len);
+#else
+        dpuf_socket_t client_sock = accept(srv_sock, (struct sockaddr*)&client_addr, (socklen_t*)&addr_len);
+#endif
+        if (client_sock == DPUF_INVALID_SOCKET) continue;
+
+        int nodelay = 1;
+#ifdef _WIN32
+        setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+#else
+        setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+#endif
+
+        size_t req_len = 0;
+        size_t content_length = 0;
+        int headers_done = 0;
+        char* body_ptr = NULL;
+
+        while (req_len + 1 < REQ_MAX_BUF) {
+#ifdef _WIN32
+            int n = recv(client_sock, req_buf + req_len, (int)(REQ_MAX_BUF - 1 - req_len), 0);
+#else
+            int n = recv(client_sock, req_buf + req_len, REQ_MAX_BUF - 1 - req_len, 0);
+#endif
+            if (n <= 0) break;
+            req_len += (size_t)n;
+            req_buf[req_len] = '\0';
+
+            if (!headers_done) {
+                char* dbl_crlf = strstr(req_buf, "\r\n\r\n");
+                if (dbl_crlf) {
+                    headers_done = 1;
+                    body_ptr = dbl_crlf + 4;
+                    char* cl = strstr(req_buf, "Content-Length:");
+                    if (!cl) cl = strstr(req_buf, "content-length:");
+                    if (cl && cl < dbl_crlf) {
+                        content_length = (size_t)strtoul(cl + 15, NULL, 10);
+                    }
+                }
+            }
+
+            if (headers_done) {
+                size_t current_body_len = req_len - (size_t)(body_ptr - req_buf);
+                if (current_body_len >= content_length) break;
+            }
+        }
+
+        if (req_len == 0) {
+            dpuf_closesocket(client_sock);
+            continue;
+        }
+
+        char method[16] = {0};
+        char path[256] = {0};
+        sscanf(req_buf, "%15s %255s", method, path);
+
+        char* qm = strchr(path, '?');
+        if (qm) *qm = '\0';
+
+        int client_slot_hdr = -1;
+        char client_agent_hdr[64] = {0};
+        char* xslot = strstr(req_buf, "X-Slot-ID:");
+        if (!xslot) xslot = strstr(req_buf, "x-slot-id:");
+        if (xslot) client_slot_hdr = atoi(xslot + 10);
+
+        char* xagent = strstr(req_buf, "X-Agent:");
+        if (!xagent) xagent = strstr(req_buf, "x-agent:");
+        if (xagent) {
+            const char* ag_start = json_skip_whitespace(xagent + 8);
+            int idx = 0;
+            while (*ag_start && *ag_start != '\r' && *ag_start != '\n' && idx + 1 < (int)sizeof(client_agent_hdr)) {
+                client_agent_hdr[idx++] = *ag_start++;
+            }
+            client_agent_hdr[idx] = '\0';
+        }
+
+        if (strcmp(method, "OPTIONS") == 0) {
+            send_http_headers(client_sock, 204, "No Content", "text/plain", 0, 0);
+        } else if (strcmp(method, "GET") == 0 && (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0)) {
+            char hbuf[512];
+            int hlen = snprintf(hbuf, sizeof(hbuf),
+                "{\"status\":\"ok\",\"model\":\"%s\",\"version\":\"2.0-dpuf\",\"backend\":\"AVX2-FMA-OpenMP\",\"slots\":%d,\"agents\":%d,\"kv_mode\":\"%s\"}",
+                m->model_name[0] ? m->model_name : "dpuf-model",
+                m->n_session_slots,
+                m->n_agents,
+                m->cfg.kv_type == DPUF_KV_Q8 ? "Q8" : "FP32");
+            send_http_response(client_sock, 200, "OK", "application/json; charset=utf-8", hbuf, (size_t)hlen);
+        } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
+            StrBuf mbuf = {0};
+            sb_append_bytes(&mbuf, "{\"object\":\"list\",\"data\":[", 25);
+            const char* mname = m->model_name[0] ? m->model_name : "dpuf-model";
+            char item[512];
+            snprintf(item, sizeof(item),
+                "{\"id\":\"%s\",\"object\":\"model\",\"created\":%ld,\"owned_by\":\"dpuf\",\"permission\":[],\"root\":\"%s\",\"parent\":null}",
+                mname, (long)time(NULL), mname);
+            sb_append_bytes(&mbuf, item, strlen(item));
+
+            for (int a = 0; a < m->n_agents; a++) {
+                char ag_item[512];
+                snprintf(ag_item, sizeof(ag_item),
+                    ",{\"id\":\"%s:%s\",\"object\":\"model\",\"created\":%ld,\"owned_by\":\"dpuf\",\"permission\":[],\"root\":\"%s\",\"parent\":\"%s\"}",
+                    mname, m->agents[a].name, (long)time(NULL), mname, mname);
+                sb_append_bytes(&mbuf, ag_item, strlen(ag_item));
+            }
+            sb_append_bytes(&mbuf, "]}", 2);
+            send_http_response(client_sock, 200, "OK", "application/json; charset=utf-8", mbuf.data, mbuf.len);
+            free(mbuf.data);
+        } else if (strcmp(method, "POST") == 0 && (strcmp(path, "/v1/chat/completions") == 0 || strcmp(path, "/v1/completions") == 0)) {
+            int is_raw = (strcmp(path, "/v1/completions") == 0);
+            const char* body = body_ptr ? body_ptr : "";
+            HttpRequestParams req_params;
+            parse_http_request_params(body, &req_params);
+            handle_chat_completions(m, client_sock, &req_params, client_agent_hdr, client_slot_hdr, is_raw);
+            free_http_request_params(&req_params);
+        } else {
+            char not_found[256];
+            snprintf(not_found, sizeof(not_found), "{\"error\":{\"message\":\"Endpoint '%s' not found\",\"type\":\"invalid_request_error\"}}", path);
+            send_http_response(client_sock, 404, "Not Found", "application/json", not_found, strlen(not_found));
+        }
+
+        dpuf_closesocket(client_sock);
+    }
+
+    free(req_buf);
+    dpuf_closesocket(srv_sock);
+    cleanup_sockets();
+    printf("\n[server] Server stopped gracefully.\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+#endif
 
     const char* model_path = NULL;
     const char* prompt = NULL;
@@ -2934,6 +3808,9 @@ int main(int argc, char** argv) {
     int do_bench = 0;
     int do_test_slots = 0;
     int n_slots_user = 0;
+    int server_mode = 0;
+    int server_port = 8080;
+    const char* server_host = "127.0.0.1";
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "-m") == 0 && i + 1 < argc) model_path = argv[++i];
@@ -2964,6 +3841,15 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--verify") == 0) verify_tiles = 1;
         else if (strcmp(argv[i], "--verify-crc") == 0) verify_payload_crc = 1;
         else if (strcmp(argv[i], "--bench") == 0) do_bench = 1;
+        else if (strcmp(argv[i], "--server") == 0) {
+            server_mode = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                server_port = atoi(argv[++i]);
+            }
+        }
+        else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            server_host = argv[++i];
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -2976,7 +3862,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     model_path = auto_detected_model;
-    if (!prompt && !do_bench) interactive = 1;
+    if (!prompt && !do_bench && !server_mode) interactive = 1;
 
     /* Topology detection and dynamic CPU scheduling */
     int total_logical = 8;
@@ -3127,6 +4013,12 @@ int main(int argc, char** argv) {
 
     if (do_bench) {
         run_bench(&model);
+    }
+
+    if (server_mode) {
+        run_http_server(&model, server_host, server_port);
+        dpuf_cli_close(&model);
+        return 0;
     }
 
     float* logits = (float*)malloc((size_t)model.cfg.vocab_size * sizeof(float));

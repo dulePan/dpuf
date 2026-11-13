@@ -271,6 +271,100 @@ DPUF introduces **Freeze & Fork Instant Prefix Caching**:
 
 ---
 
+## 🌐 OpenAI-Compatible HTTP Server & API (`--server`)
+
+DPUF includes a built-in, production-grade, zero-dependency C HTTP server that implements the standard **OpenAI API specification** (`POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`, `GET /health`).
+
+Connect any existing LLM ecosystem tool directly to your local DPUF engine:
+- **Web UIs:** OpenWebUI, LibreChat, Chatbox, AnythingLLM, LM Studio, Ollama-compatible clients.
+- **Developer Tools:** Cursor, Continue.dev, VSCode extensions, LangChain, LlamaIndex, LiteLLM.
+- **Official SDKs:** `openai` Python SDK, `openai-node`, `curl`.
+
+### 1. Launch the Server
+```bash
+# Start server on default port 8080 (multi-slot Q8 KV cache):
+dpuf-cli -m model.dpuf --server 8080 --slots 4 --kv-q8
+
+# Custom host and port:
+dpuf-cli -m model.dpuf --server 9000 --host 0.0.0.0
+```
+
+### 2. cURL Examples
+
+#### Non-streaming Chat Completion
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B",
+    "messages": [
+      {"role": "system", "content": "You are a concise assistant."},
+      {"role": "user", "content": "What is 15 * 8?"}
+    ],
+    "temperature": 0.0,
+    "max_tokens": 64
+  }'
+```
+
+#### Real-time SSE Token Streaming (`stream: true`)
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B",
+    "messages": [{"role": "user", "content": "Explain binary search in 2 sentences."}],
+    "stream": true
+  }'
+```
+
+#### Specialist Agent Routing Over HTTP (Instant 0.05ms KV-Prefix Caching)
+Select any embedded specialist persona directly via model name or `X-Agent` header:
+```bash
+# Model routing:
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B:coder",
+    "messages": [{"role": "user", "content": "Write a 1-line C macro for MIN(a,b)."}]
+  }'
+
+# Or via custom header:
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Agent: excel" \
+  -d '{"messages": [{"role": "user", "content": "How do I do XLOOKUP with multiple criteria?"}]}'
+```
+
+### 3. Python OpenAI SDK Integration
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="sk-dpuf-local"  # Any string works
+)
+
+# 1. List available models & specialist personas
+models = client.models.list()
+print("Available:", [m.id for m in models.data])
+# -> ['Qwen3-0.6B', 'Qwen3-0.6B:general', 'Qwen3-0.6B:coder', 'Qwen3-0.6B:excel']
+
+# 2. Stream tokens in real time from specialist agent
+stream = client.chat.completions.create(
+    model="Qwen3-0.6B:coder",
+    messages=[{"role": "user", "content": "Write an AVX2 memory copy function in C."}],
+    stream=True,
+    max_tokens=256
+)
+
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+print()
+```
+
+---
+
 ## 📁 Managing In-Container Profiles & Rules
 
 Every `.dpuf` container can carry its own persona and behavioral rules directly inside its header:
