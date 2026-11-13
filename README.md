@@ -96,6 +96,62 @@ dpuf-cli.exe -m model.dpuf -p "Summarize text" --eco
 dpuf-cli.exe -m model.dpuf --max -p "Compute benchmark"
 ```
 
+### 4. Native Multimodal Vision (Qwen3-VL-8B)
+DPUF features a 100% self-contained native C Vision Transformer (ViT) with Conv3D patch projection, bilinear 2D learned position embeddings, 3D M-RoPE (Multimodal Rotary Position Embeddings), and multi-layer DeepStack residual injection:
+```cmd
+:: Analyze any image with zero python/gpu dependencies:
+dpuf-cli.exe -m Qwen3-VL-8B-Instruct.dpuf --image photo.png -p "What objects and text are in this image?"
+```
+
+---
+
+## 🎭 Multi-Agent Roster: Embedded Specialists in One Model
+
+A single `.dpuf` container can hold an entire roster of domain specialists (e.g., `coder`, `excel`, `analyst`, `writer`). Switch between them with **zero reloading time (0 ms)**:
+
+```cmd
+:: List all specialists embedded in the container:
+dpuf-cli.exe -m model.dpuf --agents
+
+:: Launch directly into a specific specialist persona:
+dpuf-cli.exe -m model.dpuf --agent coder -p "Write an AVX2 matrix multiply kernel"
+dpuf-cli.exe -m model.dpuf --agent excel -p "How do I match two tables on ID in PowerQuery?"
+```
+
+### Interactive Live Agent Switching
+In interactive chat (`-i`), switch personas on the fly without exiting:
+```text
+[general] > /agents
+============================================================
+ Embedded Specialists (3 registered):
+============================================================
+  [1] general      [ACTIVE] - Versatile everyday assistant
+  [2] coder                 - Senior C/Python software engineer
+  [3] excel                 - Excel formulas and tabular analytics
+============================================================
+
+[general] > /agent coder
+[Switched to specialist: 'coder' (Senior C/Python software engineer)]
+[KV-cache reset — ready with new specialist persona]
+
+[coder] > Write a fast C ring buffer
+```
+
+### Managing Specialists via `dpuf_profile.py`
+```bash
+# Add a new specialist agent
+python dpuf_profile.py add-agent model.dpuf --name coder --desc "Senior Engineer" \
+  --system "You are an expert low-level C developer." \
+  --rules "Prioritize memory safety" "Write clean AVX2 code"
+
+# Set default starting agent
+python dpuf_profile.py set-default-agent model.dpuf coder
+
+# List or delete agents
+python dpuf_profile.py list-agents model.dpuf
+python dpuf_profile.py del-agent model.dpuf excel
+```
+
 ---
 
 ## 📁 Managing In-Container Profiles & Rules

@@ -121,6 +121,15 @@ def cmd_show(args):
     else:
         print("  (no custom rules)")
         
+    agents = profile.get("agents", [])
+    if agents:
+        def_ag = profile.get("default_agent", "")
+        print(f"\n[Multi-Agent Specialists ({len(agents)})]:")
+        for idx, ag in enumerate(agents, 1):
+            aname = ag.get("name", "unnamed")
+            is_def = " [DEFAULT]" if aname == def_ag or (idx == 1 and not def_ag) else ""
+            print(f"  [{idx}] {aname:<12}{is_def} - {ag.get('desc', '')}")
+
     telemetry = profile.get("telemetry", {})
     if telemetry:
         print(f"\n[Telemetry & Tuning Stats]:")
@@ -183,6 +192,84 @@ def cmd_import(args):
     update_dpuf_profile(args.model, mod)
     print(f"Imported profile from '{args.input}'")
 
+def cmd_list_agents(args):
+    info = read_dpuf_header(args.model)
+    meta = info["data"].get("__metadata__", {})
+    profile = meta.get("profile", {})
+    agents = profile.get("agents", [])
+    def_ag = profile.get("default_agent", "")
+    
+    print("=" * 60)
+    print(f" DPUF Multi-Agent Roster: {args.model}")
+    print(f" Registered Specialists: {len(agents)}")
+    print("=" * 60)
+    if not agents:
+        print("  (No multi-agent roster configured. Model uses single default profile.)")
+        return
+    for idx, ag in enumerate(agents, 1):
+        name = ag.get("name", "unnamed")
+        desc = ag.get("desc", "")
+        is_def = " [DEFAULT]" if name == def_ag or (idx == 1 and not def_ag) else ""
+        print(f"  [{idx}] {name:<12}{is_def} - {desc}")
+        rules = ag.get("rules", [])
+        if rules:
+            print(f"      Rules ({len(rules)}):")
+            for r in rules:
+                print(f"        * {r}")
+    print("=" * 60)
+
+def cmd_add_agent(args):
+    prompt_text = args.system or ""
+    if prompt_text and os.path.isfile(prompt_text):
+        with open(prompt_text, "r", encoding="utf-8") as f:
+            prompt_text = f.read().strip()
+            
+    rules_list = args.rules or []
+    def mod(prof):
+        agents = prof.setdefault("agents", [])
+        for ag in agents:
+            if ag.get("name") == args.name:
+                ag["desc"] = args.desc or ag.get("desc", "")
+                if prompt_text:
+                    ag["system_prompt"] = prompt_text
+                if rules_list:
+                    ag["rules"] = rules_list
+                print(f"Updated existing agent '{args.name}'.")
+                return
+        agents.append({
+            "name": args.name,
+            "desc": args.desc or "",
+            "system_prompt": prompt_text,
+            "rules": rules_list
+        })
+        if not prof.get("default_agent"):
+            prof["default_agent"] = args.name
+        print(f"Added new agent '{args.name}' ({args.desc}).")
+    update_dpuf_profile(args.model, mod)
+
+def cmd_del_agent(args):
+    def mod(prof):
+        agents = prof.get("agents", [])
+        init_len = len(agents)
+        prof["agents"] = [ag for ag in agents if ag.get("name") != args.name]
+        if len(prof["agents"]) < init_len:
+            print(f"Removed agent '{args.name}'.")
+            if prof.get("default_agent") == args.name:
+                prof["default_agent"] = prof["agents"][0]["name"] if prof["agents"] else ""
+        else:
+            print(f"Agent '{args.name}' not found.")
+    update_dpuf_profile(args.model, mod)
+
+def cmd_set_default_agent(args):
+    def mod(prof):
+        agents = prof.get("agents", [])
+        names = [ag.get("name") for ag in agents]
+        if args.name not in names:
+            print(f"Warning: '{args.name}' is not currently in registered agents {names}")
+        prof["default_agent"] = args.name
+        print(f"Default agent set to '{args.name}'.")
+    update_dpuf_profile(args.model, mod)
+
 def main():
     parser = argparse.ArgumentParser(description="Manage embedded profiles and rules in DPUF containers.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -219,6 +306,28 @@ def main():
     p_imp = sub.add_parser("import", help="Import profile from a JSON file")
     p_imp.add_argument("model", help="Path to .dpuf model")
     p_imp.add_argument("input", help="Path to input .json")
+
+    # list-agents
+    p_lag = sub.add_parser("list-agents", help="List all registered agents in model roster")
+    p_lag.add_argument("model", help="Path to .dpuf model")
+
+    # add-agent
+    p_aag = sub.add_parser("add-agent", help="Add or update a specialized agent in the roster")
+    p_aag.add_argument("model", help="Path to .dpuf model")
+    p_aag.add_argument("--name", required=True, help="Agent identifier name (e.g. coder, excel)")
+    p_aag.add_argument("--desc", default="", help="Short description of specialist role")
+    p_aag.add_argument("--system", default="", help="Agent system prompt or path to prompt file")
+    p_aag.add_argument("--rules", nargs="*", help="List of behavioral rules/directives")
+
+    # del-agent
+    p_dag = sub.add_parser("del-agent", help="Remove an agent from the roster by name")
+    p_dag.add_argument("model", help="Path to .dpuf model")
+    p_dag.add_argument("name", help="Name of agent to delete")
+
+    # set-default-agent
+    p_sdef = sub.add_parser("set-default-agent", help="Set the default active agent")
+    p_sdef.add_argument("model", help="Path to .dpuf model")
+    p_sdef.add_argument("name", help="Name of agent to set as default")
     
     args = parser.parse_args()
     if args.command == "show":
@@ -235,6 +344,14 @@ def main():
         cmd_export(args)
     elif args.command == "import":
         cmd_import(args)
+    elif args.command == "list-agents":
+        cmd_list_agents(args)
+    elif args.command == "add-agent":
+        cmd_add_agent(args)
+    elif args.command == "del-agent":
+        cmd_del_agent(args)
+    elif args.command == "set-default-agent":
+        cmd_set_default_agent(args)
 
 if __name__ == "__main__":
     main()

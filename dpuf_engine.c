@@ -1362,8 +1362,7 @@ DPUF_EXPORT int32_t dpuf_engine_forward_batch_ex(
     DpufEngine* eng = (DpufEngine*)handle;
     if (!eng || (!token_ids && !embeds_in) || (!logits_out && only_last_logits != 2)) return -1;
     if (n_tokens <= 0 || n_tokens > DPUF_ENGINE_MAX_BATCH) return -2;
-    int32_t effective_pos0 = pos_t ? pos_t[0] : pos0;
-    if (effective_pos0 < 0 || effective_pos0 + n_tokens > eng->cfg.max_seq_len) return -3;
+    if (pos0 < 0 || pos0 + n_tokens > eng->cfg.max_seq_len) return -3;
 
     const int32_t M = n_tokens;
     const int32_t h_dim = eng->cfg.hidden_size;
@@ -1511,7 +1510,7 @@ DPUF_EXPORT int32_t dpuf_engine_forward_batch_ex(
                     float* vs_head   = is_q8_kv ? (eng->v_scale_q8 + ((size_t)l * (size_t)n_kv + (size_t)kvh) * scale_head_stride) : NULL;
 
                     for (int32_t m = 0; m < M; m++) {
-                        int32_t pos = pos_t ? pos_t[m] : (pos0 + m);
+                        int32_t pos = pos0 + m;
                         const float* cos_p = token_cos_p[m];
                         const float* sin_p = token_sin_p[m];
                         float* k_src = eng->k_buf + (size_t)m * (size_t)kv_dim + (size_t)kvh * (size_t)hd;
@@ -1532,7 +1531,7 @@ DPUF_EXPORT int32_t dpuf_engine_forward_batch_ex(
                     }
 
                     for (int32_t m = 0; m < M; m++) {
-                        int32_t pos = pos_t ? pos_t[m] : (pos0 + m);
+                        int32_t pos = pos0 + m;
                         int32_t kv_len = pos + 1;
                         const float* cos_p = token_cos_p[m];
                         const float* sin_p = token_sin_p[m];
@@ -1567,7 +1566,7 @@ DPUF_EXPORT int32_t dpuf_engine_forward_batch_ex(
                 for (int32_t idx = tid; idx < tot_kv; idx += nt) {
                     int32_t m = idx / n_kv;
                     int32_t kvh = idx % n_kv;
-                    int32_t pos = pos_t ? pos_t[m] : (pos0 + m);
+                    int32_t pos = pos0 + m;
                     const float* cos_p = token_cos_p[m];
                     const float* sin_p = token_sin_p[m];
                     float* k_src = eng->k_buf + (size_t)m * (size_t)kv_dim + (size_t)kvh * (size_t)hd;
@@ -1594,7 +1593,6 @@ DPUF_EXPORT int32_t dpuf_engine_forward_batch_ex(
                 for (int32_t idx = tid; idx < tot_q; idx += nt) {
                     int32_t m = idx / n_q;
                     int32_t qh = idx % n_q;
-                    int32_t pos = pos_t ? pos_t[m] : (pos0 + m);
                     const float* cos_p = token_cos_p[m];
                     const float* sin_p = token_sin_p[m];
                     float* q_vec = eng->q_buf + (size_t)m * (size_t)q_dim + (size_t)qh * (size_t)hd;

@@ -991,6 +991,16 @@ typedef struct {
 } TensorEntry;
 
 typedef struct {
+    char  name[32];
+    char  desc[128];
+    char  system_prompt[4096];
+    char* rules[64];
+    int   n_rules;
+} DpufAgent;
+
+#define MAX_DPOF_AGENTS 16
+
+typedef struct {
     MmapView        mv;
     uint64_t        payload_base;
     DpufModelConfig cfg;
@@ -1025,6 +1035,11 @@ typedef struct {
     char            profile_system_prompt[4096];
     char*           profile_rules[64];
     int             n_profile_rules;
+
+    /* Multi-Agent Roster */
+    DpufAgent       agents[MAX_DPOF_AGENTS];
+    int             n_agents;
+    int             active_agent_idx;
 } DpufCliModel;
 
 static void track_owned(DpufCliModel* m, void* ptr) {
@@ -1300,15 +1315,62 @@ static int parse_tokenizer_obj(JsonCur* c, BpeTokenizer* tok) {
     return bpe_finalize_tables(tok);
 }
 
+static int parse_single_agent(JsonCur* c, DpufAgent* ag) {
+    if (!j_consume(c, '{')) return 0;
+    memset(ag, 0, sizeof(*ag));
+    StrBuf key = {0}, val = {0};
+    if (j_peek(c) != '}') {
+        for (;;) {
+            if (!j_parse_str_into(c, &key) || !j_consume(c, ':')) { free(key.data); free(val.data); return 0; }
+            if (strcmp(key.data, "name") == 0 && j_peek(c) == '"') {
+                if (j_parse_str_into(c, &val)) snprintf(ag->name, sizeof(ag->name), "%s", val.data);
+            } else if (strcmp(key.data, "desc") == 0 && j_peek(c) == '"') {
+                if (j_parse_str_into(c, &val)) snprintf(ag->desc, sizeof(ag->desc), "%s", val.data);
+            } else if (strcmp(key.data, "system_prompt") == 0 && j_peek(c) == '"') {
+                if (j_parse_str_into(c, &val)) snprintf(ag->system_prompt, sizeof(ag->system_prompt), "%s", val.data);
+            } else if (strcmp(key.data, "rules") == 0 && j_peek(c) == '[') {
+                j_consume(c, '[');
+                if (j_peek(c) != ']') {
+                    for (;;) {
+                        if (j_peek(c) == '"') {
+                            if (!j_parse_str_into(c, &val)) { free(key.data); free(val.data); return 0; }
+                            if (ag->n_rules < 64) {
+                                ag->rules[ag->n_rules++] = _strdup(val.data);
+                            }
+                        } else {
+                            if (!j_skip_val(c)) { free(key.data); free(val.data); return 0; }
+                        }
+                        if (j_consume(c, ',')) continue;
+                        if (j_consume(c, ']')) break;
+                        free(key.data); free(val.data); return 0;
+                    }
+                } else j_consume(c, ']');
+            } else {
+                if (!j_skip_val(c)) { free(key.data); free(val.data); return 0; }
+            }
+            if (j_consume(c, ',')) continue;
+            if (j_consume(c, '}')) break;
+            free(key.data); free(val.data); return 0;
+        }
+    } else j_consume(c, '}');
+    free(key.data);
+    free(val.data);
+    return 1;
+}
+
 static int parse_profile_obj(JsonCur* c, DpufCliModel* m) {
     if (!j_consume(c, '{')) return 0;
     StrBuf pkey = {0}, pval = {0};
+    char default_agent_name[32] = {0};
     if (j_peek(c) != '}') {
         for (;;) {
             if (!j_parse_str_into(c, &pkey) || !j_consume(c, ':')) { free(pkey.data); free(pval.data); return 0; }
             if (strcmp(pkey.data, "system_prompt") == 0 && j_peek(c) == '"') {
                 if (!j_parse_str_into(c, &pval)) { free(pkey.data); free(pval.data); return 0; }
                 snprintf(m->profile_system_prompt, sizeof(m->profile_system_prompt), "%s", pval.data);
+            } else if (strcmp(pkey.data, "default_agent") == 0 && j_peek(c) == '"') {
+                if (!j_parse_str_into(c, &pval)) { free(pkey.data); free(pval.data); return 0; }
+                snprintf(default_agent_name, sizeof(default_agent_name), "%s", pval.data);
             } else if (strcmp(pkey.data, "rules") == 0 && j_peek(c) == '[') {
                 j_consume(c, '[');
                 if (j_peek(c) != ']') {
@@ -1317,6 +1379,27 @@ static int parse_profile_obj(JsonCur* c, DpufCliModel* m) {
                             if (!j_parse_str_into(c, &pval)) { free(pkey.data); free(pval.data); return 0; }
                             if (m->n_profile_rules < 64) {
                                 m->profile_rules[m->n_profile_rules++] = _strdup(pval.data);
+                            }
+                        } else {
+                            if (!j_skip_val(c)) { free(pkey.data); free(pval.data); return 0; }
+                        }
+                        if (j_consume(c, ',')) continue;
+                        if (j_consume(c, ']')) break;
+                        free(pkey.data); free(pval.data); return 0;
+                    }
+                } else j_consume(c, ']');
+            } else if (strcmp(pkey.data, "agents") == 0 && j_peek(c) == '[') {
+                j_consume(c, '[');
+                if (j_peek(c) != ']') {
+                    for (;;) {
+                        if (j_peek(c) == '{') {
+                            if (m->n_agents < MAX_DPOF_AGENTS) {
+                                DpufAgent* ag = &m->agents[m->n_agents];
+                                if (parse_single_agent(c, ag)) {
+                                    m->n_agents++;
+                                }
+                            } else {
+                                if (!j_skip_val(c)) { free(pkey.data); free(pval.data); return 0; }
                             }
                         } else {
                             if (!j_skip_val(c)) { free(pkey.data); free(pval.data); return 0; }
@@ -1336,6 +1419,29 @@ static int parse_profile_obj(JsonCur* c, DpufCliModel* m) {
     } else j_consume(c, '}');
     free(pkey.data);
     free(pval.data);
+
+    /* If no explicit agents were in JSON array, synthesize a default agent from top-level profile */
+    if (m->n_agents == 0) {
+        DpufAgent* def = &m->agents[m->n_agents++];
+        snprintf(def->name, sizeof(def->name), "default");
+        snprintf(def->desc, sizeof(def->desc), "Default Assistant Persona");
+        snprintf(def->system_prompt, sizeof(def->system_prompt), "%s", m->profile_system_prompt);
+        for (int r = 0; r < m->n_profile_rules && r < 64; r++) {
+            def->rules[def->n_rules++] = _strdup(m->profile_rules[r]);
+        }
+        m->active_agent_idx = 0;
+    } else {
+        /* If default_agent was specified, set active_agent_idx */
+        m->active_agent_idx = 0;
+        if (default_agent_name[0]) {
+            for (int a = 0; a < m->n_agents; a++) {
+                if (_stricmp(m->agents[a].name, default_agent_name) == 0) {
+                    m->active_agent_idx = a;
+                    break;
+                }
+            }
+        }
+    }
     return 1;
 }
 
@@ -1562,6 +1668,13 @@ static void dpuf_cli_close(DpufCliModel* m) {
     if (m->engine) dpuf_engine_destroy(m->engine);
     for (int32_t i = 0; i < m->n_owned; i++) free(m->owned_ptrs[i]);
     free(m->owned_ptrs);
+    for (int a = 0; a < m->n_agents; a++) {
+        for (int r = 0; r < m->agents[a].n_rules; r++) {
+            free(m->agents[a].rules[r]);
+        }
+        m->agents[a].n_rules = 0;
+    }
+    m->n_agents = 0;
     for (int i = 0; i < m->n_profile_rules; i++) free(m->profile_rules[i]);
     m->n_profile_rules = 0;
     free(m->layers);
@@ -1817,19 +1930,34 @@ static void build_formatted_prompt(
         sb_append_bytes(out, user_text, strlen(user_text));
         return;
     }
-    int has_profile = (m->profile_system_prompt[0] != '\0' || m->n_profile_rules > 0);
+
+    /* Resolve active persona from multi-agent roster or fallback profile */
+    const char* active_sys = m->profile_system_prompt;
+    char* const* active_rules = m->profile_rules;
+    int n_active_rules = m->n_profile_rules;
+
+    if (m->n_agents > 0 && m->active_agent_idx >= 0 && m->active_agent_idx < m->n_agents) {
+        const DpufAgent* ag = &m->agents[m->active_agent_idx];
+        if (ag->system_prompt[0] != '\0') active_sys = ag->system_prompt;
+        if (ag->n_rules > 0) {
+            active_rules = ag->rules;
+            n_active_rules = ag->n_rules;
+        }
+    }
+
+    int has_profile = (active_sys[0] != '\0' || n_active_rules > 0);
     if (strcmp(m->tok.chat_format, "llama3") == 0) {
         if (is_first_turn) {
             sb_append_bytes(out, "<|begin_of_text|>", 17);
             if (has_profile) {
                 sb_append_bytes(out, "<|start_header_id|>system<|end_header_id|>\n\n", 43);
-                if (m->profile_system_prompt[0] != '\0') {
-                    sb_append_bytes(out, m->profile_system_prompt, strlen(m->profile_system_prompt));
+                if (active_sys[0] != '\0') {
+                    sb_append_bytes(out, active_sys, strlen(active_sys));
                     sb_append_bytes(out, "\n", 1);
                 }
-                for (int r = 0; r < m->n_profile_rules; r++) {
+                for (int r = 0; r < n_active_rules; r++) {
                     char rline[512];
-                    snprintf(rline, sizeof(rline), "- %s\n", m->profile_rules[r]);
+                    snprintf(rline, sizeof(rline), "- %s\n", active_rules[r]);
                     sb_append_bytes(out, rline, strlen(rline));
                 }
                 sb_append_bytes(out, "<|eot_id|>", 10);
@@ -1842,13 +1970,13 @@ static void build_formatted_prompt(
         /* ChatML (Qwen3) */
         if (is_first_turn && has_profile) {
             sb_append_bytes(out, "<|im_start|>system\n", 19);
-            if (m->profile_system_prompt[0] != '\0') {
-                sb_append_bytes(out, m->profile_system_prompt, strlen(m->profile_system_prompt));
+            if (active_sys[0] != '\0') {
+                sb_append_bytes(out, active_sys, strlen(active_sys));
                 sb_append_bytes(out, "\n", 1);
             }
-            for (int r = 0; r < m->n_profile_rules; r++) {
+            for (int r = 0; r < n_active_rules; r++) {
                 char rline[512];
-                snprintf(rline, sizeof(rline), "- %s\n", m->profile_rules[r]);
+                snprintf(rline, sizeof(rline), "- %s\n", active_rules[r]);
                 sb_append_bytes(out, rline, strlen(rline));
             }
             sb_append_bytes(out, "<|im_end|>\n", 11);
@@ -2034,7 +2162,7 @@ static int32_t run_vision_turn(
 
     /* Build text prefix: <|im_start|>user\n<|vision_start|> */
     StrBuf p_prefix = {0};
-    sb_append_bytes(&p_prefix, "<|im_start|>user\n<|vision_start|>", 34);
+    sb_append_bytes(&p_prefix, "<|im_start|>user\n<|vision_start|>", 33);
     IntVec ids_pre = {0};
     bpe_encode(&m->tok, p_prefix.data, 0, &ids_pre);
     free(p_prefix.data);
@@ -2149,9 +2277,10 @@ static int32_t run_vision_turn(
     int32_t hit_eos = -1;
     char dec_buf[512];
     double t_tg = now_ms();
-    int32_t pos = cur_pos;
+    int32_t seq_pos = total_prompt_tokens;
+    int32_t mrope_pos = cur_pos;
 
-    while (generated < max_new_tokens && pos < m->cfg.max_seq_len) {
+    while (generated < max_new_tokens && seq_pos < m->cfg.max_seq_len) {
         if (bpe_is_eos(&m->tok, next_tok)) {
             hit_eos = next_tok;
             break;
@@ -2161,8 +2290,24 @@ static int32_t run_vision_turn(
             fwrite(dec_buf, 1, dn, stdout);
             fflush(stdout);
         }
-        dpuf_engine_forward_token(m->engine, next_tok, pos, logits);
-        pos++;
+        int32_t rc = dpuf_engine_forward_batch_ex(
+            m->engine, 1,
+            &next_tok,
+            seq_pos,
+            NULL,
+            &mrope_pos,
+            &mrope_pos,
+            &mrope_pos,
+            NULL,
+            1,
+            logits
+        );
+        if (rc != 0) {
+            fprintf(stderr, "\n[Engine forward_batch_ex error: %d]\n", rc);
+            break;
+        }
+        seq_pos++;
+        mrope_pos++;
         generated++;
         next_tok = sample_token(logits, m->cfg.vocab_size, temp);
     }
@@ -2181,7 +2326,7 @@ static int32_t run_vision_turn(
     free(ids_suf.ids);
     dpuf_vision_free_output(&vis_out);
     if (out_hit_eos_id) *out_hit_eos_id = hit_eos;
-    return pos;
+    return seq_pos;
 }
 
 static void print_usage(const char* prog) {
@@ -2199,6 +2344,8 @@ static void print_usage(const char* prog) {
     printf("  --kv-q8         Use quantized 8-bit KV-cache (~4x less RAM for long context)\n");
     printf("  --temp <val>    Sampling temperature (0 = greedy, default: 0.0)\n");
     printf("  --system <text> Override embedded system prompt\n");
+    printf("  --agent <name>  Select active specialist agent from container roster\n");
+    printf("  --agents        List all specialized agents in this model container and exit\n");
     printf("  --rules         Display embedded profile, system prompt, and rules\n");
     printf("  --show-profile  Alias for --rules\n");
     printf("  --raw           Bypass chat template (raw completion)\n");
@@ -2319,6 +2466,8 @@ int main(int argc, char** argv) {
     const char* image_path = NULL;
     const char* system_override = NULL;
     const char* priority_override = NULL;
+    const char* agent_requested = NULL;
+    int show_agents = 0;
     int show_profile = 0;
     int interactive = 0;
     int max_new = 128;
@@ -2353,6 +2502,8 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--kv-q8") == 0) kv_q8 = 1;
         else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) temp = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) system_override = argv[++i];
+        else if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) agent_requested = argv[++i];
+        else if (strcmp(argv[i], "--agents") == 0) show_agents = 1;
         else if (strcmp(argv[i], "--rules") == 0 || strcmp(argv[i], "--show-profile") == 0) show_profile = 1;
         else if (strcmp(argv[i], "--raw") == 0) raw_mode = 1;
         else if (strcmp(argv[i], "--think") == 0) think_mode = 1;
@@ -2418,16 +2569,77 @@ int main(int argc, char** argv) {
 
     if (system_override) {
         snprintf(model.profile_system_prompt, sizeof(model.profile_system_prompt), "%s", system_override);
+        if (model.n_agents > 0 && model.active_agent_idx >= 0) {
+            snprintf(model.agents[model.active_agent_idx].system_prompt,
+                     sizeof(model.agents[model.active_agent_idx].system_prompt), "%s", system_override);
+        }
+    }
+
+    if (agent_requested) {
+        int chosen_idx = -1;
+        int num = atoi(agent_requested);
+        if (num >= 1 && num <= model.n_agents) {
+            chosen_idx = num - 1;
+        } else {
+            for (int a = 0; a < model.n_agents; a++) {
+                if (_stricmp(model.agents[a].name, agent_requested) == 0) {
+                    chosen_idx = a;
+                    break;
+                }
+            }
+        }
+        if (chosen_idx >= 0) {
+            model.active_agent_idx = chosen_idx;
+        } else {
+            fprintf(stderr, "[Warning: Agent '%s' not found in model roster, keeping '%s']\n",
+                agent_requested,
+                model.n_agents > 0 ? model.agents[model.active_agent_idx].name : "default");
+        }
+    }
+
+    if (show_agents) {
+        printf("============================================================\n");
+        printf(" DPUF Multi-Agent Roster: %s\n", model.model_name[0] ? model.model_name : model_path);
+        printf(" Available Specialists (%d registered):\n", model.n_agents);
+        printf("============================================================\n");
+        for (int a = 0; a < model.n_agents; a++) {
+            printf("  [%d] %-12s %s - %s\n",
+                a + 1,
+                model.agents[a].name,
+                (a == model.active_agent_idx) ? "[ACTIVE]" : "        ",
+                model.agents[a].desc[0] ? model.agents[a].desc : "Specialist persona");
+            if (model.agents[a].n_rules > 0) {
+                printf("      Directives (%d rules):\n", model.agents[a].n_rules);
+                for (int r = 0; r < model.agents[a].n_rules; r++) {
+                    printf("        * %s\n", model.agents[a].rules[r]);
+                }
+            }
+        }
+        printf("============================================================\n");
+        dpuf_cli_close(&model);
+        return 0;
     }
 
     if (show_profile) {
+        const DpufAgent* cur_ag = (model.n_agents > 0 && model.active_agent_idx >= 0) ?
+            &model.agents[model.active_agent_idx] : NULL;
+        const char* sys = cur_ag && cur_ag->system_prompt[0] ? cur_ag->system_prompt : model.profile_system_prompt;
+        char* const* rls = (cur_ag && cur_ag->n_rules > 0) ? cur_ag->rules : model.profile_rules;
+        int nr = (cur_ag && cur_ag->n_rules > 0) ? cur_ag->n_rules : model.n_profile_rules;
+
         printf("============================================================\n");
         printf(" DPUF Container Profile & Rules\n");
         printf(" Model Name    : %s\n", model.model_name[0] ? model.model_name : model_path);
-        printf(" System Prompt : %s\n", model.profile_system_prompt[0] ? model.profile_system_prompt : "(none)");
-        printf(" Active Rules  : %d\n", model.n_profile_rules);
-        for (int r = 0; r < model.n_profile_rules; r++) {
-            printf("   [%d] %s\n", r + 1, model.profile_rules[r]);
+        printf(" Active Agent  : %s\n", cur_ag ? cur_ag->name : "default");
+        printf(" Description   : %s\n", cur_ag && cur_ag->desc[0] ? cur_ag->desc : "(standard persona)");
+        printf(" System Prompt : %s\n", sys[0] ? sys : "(none)");
+        printf(" Active Rules  : %d\n", nr);
+        for (int r = 0; r < nr; r++) {
+            printf("   [%d] %s\n", r + 1, rls[r]);
+        }
+        if (model.n_agents > 1) {
+            printf("------------------------------------------------------------\n");
+            printf(" Other Registered Agents (%d total): use --agents to list\n", model.n_agents);
         }
         printf("============================================================\n");
         dpuf_cli_close(&model);
@@ -2442,7 +2654,9 @@ int main(int argc, char** argv) {
         model.w_tok_embd.mode, model.layers[0].w_q.mode, model.tok.chat_format,
         model.open_ms);
     printf(" [threads=%d/%d, %s%d free for OS]", n_threads, total_logical, eco_mode ? "eco, " : (force_max_threads ? "max, " : "auto, "), total_logical - n_threads);
-    if (model.profile_system_prompt[0] || model.n_profile_rules > 0) {
+    if (model.n_agents > 1) {
+        printf(" [agent: '%s' (%d specialists)]", model.agents[model.active_agent_idx].name, model.n_agents);
+    } else if (model.profile_system_prompt[0] || model.n_profile_rules > 0) {
         printf(" [profile: %d rules]", model.n_profile_rules);
     }
     if (verify_tiles) printf(" [QR verify OK, healed=%d tiles]", model.healed_tiles_total);
@@ -2475,15 +2689,90 @@ int main(int argc, char** argv) {
     if (interactive) {
         char line[4096];
         int first_turn = (pos == 0);
-        printf("[Interactive chat ready — type message, or 'exit' / '/reset']\n");
+        const char* cur_ag_name = (model.n_agents > 0 && model.active_agent_idx >= 0) ?
+            model.agents[model.active_agent_idx].name : "default";
+        printf("[Interactive chat ready | active agent: '%s']\n", cur_ag_name);
+        printf("[Commands: /agents, /agent <name|idx>, /rules, /reset, /help, exit]\n");
         while (1) {
-            printf("\n> ");
+            printf("\n[%s] > ", (model.n_agents > 0 && model.active_agent_idx >= 0) ?
+                model.agents[model.active_agent_idx].name : "chat");
             fflush(stdout);
             if (!fgets(line, sizeof(line), stdin)) break;
             size_t len = strlen(line);
             while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
             if (len == 0) continue;
             if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0) break;
+            if (strcmp(line, "/help") == 0) {
+                printf("\nAvailable interactive commands:\n");
+                printf("  /agents            - List all specialized agents in this model\n");
+                printf("  /agent <name|idx>  - Switch active specialist (resets context for new persona)\n");
+                printf("  /rules             - Show active system prompt and directives\n");
+                printf("  /reset             - Reset KV-cache conversation history\n");
+                printf("  exit / quit        - Exit session\n");
+                continue;
+            }
+            if (strcmp(line, "/agents") == 0) {
+                printf("\n============================================================\n");
+                printf(" Embedded Specialists (%d registered):\n", model.n_agents);
+                printf("============================================================\n");
+                for (int a = 0; a < model.n_agents; a++) {
+                    printf("  [%d] %-12s %s - %s\n",
+                        a + 1,
+                        model.agents[a].name,
+                        (a == model.active_agent_idx) ? "[ACTIVE]" : "        ",
+                        model.agents[a].desc[0] ? model.agents[a].desc : "Specialist persona");
+                }
+                printf("============================================================\n");
+                printf("Use '/agent <name|idx>' to switch active agent.\n");
+                continue;
+            }
+            if (strncmp(line, "/agent ", 7) == 0) {
+                const char* target = line + 7;
+                while (*target == ' ') target++;
+                int chosen_idx = -1;
+                int num = atoi(target);
+                if (num >= 1 && num <= model.n_agents) {
+                    chosen_idx = num - 1;
+                } else {
+                    for (int a = 0; a < model.n_agents; a++) {
+                        if (_stricmp(model.agents[a].name, target) == 0) {
+                            chosen_idx = a;
+                            break;
+                        }
+                    }
+                }
+                if (chosen_idx >= 0) {
+                    model.active_agent_idx = chosen_idx;
+                    dpuf_engine_reset_cache(model.engine);
+                    pos = 0;
+                    first_turn = 1;
+                    printf("[Switched to specialist: '%s' (%s)]\n",
+                        model.agents[chosen_idx].name,
+                        model.agents[chosen_idx].desc[0] ? model.agents[chosen_idx].desc : "active");
+                    printf("[KV-cache reset — ready with new specialist persona]\n");
+                } else {
+                    printf("[Error: Agent '%s' not found. Type '/agents' to see roster]\n", target);
+                }
+                continue;
+            }
+            if (strcmp(line, "/rules") == 0) {
+                const DpufAgent* cur_ag = (model.n_agents > 0 && model.active_agent_idx >= 0) ?
+                    &model.agents[model.active_agent_idx] : NULL;
+                const char* sys = cur_ag && cur_ag->system_prompt[0] ? cur_ag->system_prompt : model.profile_system_prompt;
+                char* const* rls = (cur_ag && cur_ag->n_rules > 0) ? cur_ag->rules : model.profile_rules;
+                int nr = (cur_ag && cur_ag->n_rules > 0) ? cur_ag->n_rules : model.n_profile_rules;
+
+                printf("\n============================================================\n");
+                printf(" Active Agent  : %s\n", cur_ag ? cur_ag->name : "default");
+                printf(" Description   : %s\n", cur_ag && cur_ag->desc[0] ? cur_ag->desc : "(standard persona)");
+                printf(" System Prompt : %s\n", sys[0] ? sys : "(none)");
+                printf(" Directives    : %d rules\n", nr);
+                for (int r = 0; r < nr; r++) {
+                    printf("   [%d] %s\n", r + 1, rls[r]);
+                }
+                printf("============================================================\n");
+                continue;
+            }
             if (strcmp(line, "/reset") == 0) {
                 dpuf_engine_reset_cache(model.engine);
                 pos = 0;
