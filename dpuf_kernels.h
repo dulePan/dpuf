@@ -328,6 +328,9 @@ DPUF_EXPORT int32_t dpuf_engine_get_slot(void* handle);
 DPUF_EXPORT void    dpuf_engine_reset_slot(void* handle, int32_t slot_id);
 DPUF_EXPORT size_t  dpuf_engine_slot_memory(void* handle);
 DPUF_EXPORT int32_t dpuf_engine_num_slots(void* handle);
+DPUF_EXPORT int32_t dpuf_engine_freeze_prefix(void* handle, int32_t prefix_id, int32_t prefix_len);
+DPUF_EXPORT int32_t dpuf_engine_apply_prefix(void* handle, int32_t slot_id, int32_t prefix_id);
+DPUF_EXPORT int32_t dpuf_engine_get_prefix_len(void* handle, int32_t prefix_id);
 DPUF_EXPORT int32_t dpuf_engine_forward_batch(
     void* handle,
     int32_t n_tokens,

@@ -92,6 +92,7 @@ static __forceinline void engine_barrier(DpufSpinBarrier* bar, int32_t n_threads
 }
 
 #define DPUF_MAX_SLOTS 8
+#define DPUF_MAX_PREFIXES 8
 
 typedef struct {
     float*  k_cache;
@@ -103,6 +104,18 @@ typedef struct {
     int32_t cur_pos;
     int     is_allocated;
 } DpufKvSlot;
+
+typedef struct {
+    float*  k_cache;
+    float*  v_cache;
+    int8_t* k_cache_q8;
+    int8_t* v_cache_q8;
+    float*  k_scale_q8;
+    float*  v_scale_q8;
+    int32_t prefix_len;
+    int32_t max_prefix_cap;
+    int     is_valid;
+} DpufPrefixCache;
 
 typedef struct {
     DpufModelConfig cfg;
@@ -119,6 +132,9 @@ typedef struct {
     DpufKvSlot slots[DPUF_MAX_SLOTS];
     int32_t    n_slots;
     int32_t    active_slot;
+
+    /* Frozen Instant KV Prefix Caches */
+    DpufPrefixCache prefixes[DPUF_MAX_PREFIXES];
 
     /* Active slot pointers [num_layers, num_kv_heads, max_seq_len, head_dim] (contiguous over pos) */
     float*  k_cache;
@@ -1354,6 +1370,15 @@ DPUF_EXPORT void dpuf_engine_destroy(void* handle) {
             eng->slots[s].is_allocated = 0;
         }
     }
+    for (int p = 0; p < DPUF_MAX_PREFIXES; p++) {
+        free(eng->prefixes[p].k_cache);
+        free(eng->prefixes[p].v_cache);
+        free(eng->prefixes[p].k_cache_q8);
+        free(eng->prefixes[p].v_cache_q8);
+        free(eng->prefixes[p].k_scale_q8);
+        free(eng->prefixes[p].v_scale_q8);
+        eng->prefixes[p].is_valid = 0;
+    }
     free(eng->h_buf);
     free(eng->hn_buf);
     free(eng->q_buf);
@@ -1441,6 +1466,137 @@ DPUF_EXPORT size_t dpuf_engine_slot_memory(void* handle) {
     } else {
         return 2 * kv_elems * sizeof(float);
     }
+}
+
+static int prefix_allocate(DpufEngine* eng, int32_t pfx_id, int32_t needed_cap) {
+    if (!eng || pfx_id < 0 || pfx_id >= DPUF_MAX_PREFIXES) return 0;
+    DpufPrefixCache* pfx = &eng->prefixes[pfx_id];
+    if (pfx->max_prefix_cap >= needed_cap && (pfx->k_cache_q8 || pfx->k_cache)) return 1;
+
+    free(pfx->k_cache); free(pfx->v_cache);
+    free(pfx->k_cache_q8); free(pfx->v_cache_q8);
+    free(pfx->k_scale_q8); free(pfx->v_scale_q8);
+    memset(pfx, 0, sizeof(*pfx));
+
+    size_t kv_dim = (size_t)eng->cfg.num_kv_heads * (size_t)eng->cfg.head_dim;
+    size_t kv_elems = (size_t)eng->cfg.num_layers * (size_t)needed_cap * kv_dim;
+
+    if (eng->cfg.kv_type == DPUF_KV_Q8) {
+        size_t scale_elems = (size_t)eng->cfg.num_layers * (size_t)needed_cap * (kv_dim >> 5);
+        pfx->k_cache_q8 = (int8_t*)calloc(kv_elems, sizeof(int8_t));
+        pfx->v_cache_q8 = (int8_t*)calloc(kv_elems, sizeof(int8_t));
+        pfx->k_scale_q8 = (float*)calloc(scale_elems, sizeof(float));
+        pfx->v_scale_q8 = (float*)calloc(scale_elems, sizeof(float));
+        if (!pfx->k_cache_q8 || !pfx->v_cache_q8 || !pfx->k_scale_q8 || !pfx->v_scale_q8) {
+            free(pfx->k_cache_q8); free(pfx->v_cache_q8);
+            free(pfx->k_scale_q8); free(pfx->v_scale_q8);
+            memset(pfx, 0, sizeof(*pfx));
+            return 0;
+        }
+    } else {
+        pfx->k_cache = (float*)calloc(kv_elems, sizeof(float));
+        pfx->v_cache = (float*)calloc(kv_elems, sizeof(float));
+        if (!pfx->k_cache || !pfx->v_cache) {
+            free(pfx->k_cache); free(pfx->v_cache);
+            memset(pfx, 0, sizeof(*pfx));
+            return 0;
+        }
+    }
+    pfx->max_prefix_cap = needed_cap;
+    return 1;
+}
+
+DPUF_EXPORT int32_t dpuf_engine_freeze_prefix(void* handle, int32_t pfx_id, int32_t prefix_len) {
+    DpufEngine* eng = (DpufEngine*)handle;
+    if (!eng || pfx_id < 0 || pfx_id >= DPUF_MAX_PREFIXES || prefix_len <= 0) return 0;
+    if (prefix_len > eng->cfg.max_seq_len) return 0;
+
+    if (!prefix_allocate(eng, pfx_id, prefix_len)) return 0;
+    DpufPrefixCache* pfx = &eng->prefixes[pfx_id];
+    DpufKvSlot* cur_sl = &eng->slots[eng->active_slot];
+    if (!cur_sl->is_allocated) return 0;
+
+    const int32_t n_layers = eng->cfg.num_layers;
+    const int32_t n_kv = eng->cfg.num_kv_heads;
+    const int32_t hd = eng->cfg.head_dim;
+    const int32_t hd_blk = (hd + 31) / 32;
+    const size_t head_stride = (size_t)eng->cfg.max_seq_len * (size_t)hd;
+    const size_t layer_kv_stride = (size_t)eng->cfg.max_seq_len * (size_t)n_kv * (size_t)hd;
+    const size_t scale_head_stride = (size_t)eng->cfg.max_seq_len * (size_t)hd_blk;
+    const int is_q8 = (eng->cfg.kv_type == DPUF_KV_Q8);
+
+    for (int32_t l = 0; l < n_layers; l++) {
+        for (int32_t kvh = 0; kvh < n_kv; kvh++) {
+            size_t pfx_head_off = ((size_t)l * (size_t)n_kv + (size_t)kvh) * (size_t)prefix_len * (size_t)hd;
+            size_t slot_head_off = (size_t)l * layer_kv_stride + (size_t)kvh * head_stride;
+
+            if (is_q8) {
+                memcpy(pfx->k_cache_q8 + pfx_head_off, cur_sl->k_cache_q8 + slot_head_off, (size_t)prefix_len * (size_t)hd * sizeof(int8_t));
+                memcpy(pfx->v_cache_q8 + pfx_head_off, cur_sl->v_cache_q8 + slot_head_off, (size_t)prefix_len * (size_t)hd * sizeof(int8_t));
+
+                size_t pfx_scale_off = ((size_t)l * (size_t)n_kv + (size_t)kvh) * (size_t)prefix_len * (size_t)hd_blk;
+                size_t slot_scale_off = ((size_t)l * (size_t)n_kv + (size_t)kvh) * scale_head_stride;
+                memcpy(pfx->k_scale_q8 + pfx_scale_off, cur_sl->k_scale_q8 + slot_scale_off, (size_t)prefix_len * (size_t)hd_blk * sizeof(float));
+                memcpy(pfx->v_scale_q8 + pfx_scale_off, cur_sl->v_scale_q8 + slot_scale_off, (size_t)prefix_len * (size_t)hd_blk * sizeof(float));
+            } else {
+                memcpy(pfx->k_cache + pfx_head_off, cur_sl->k_cache + slot_head_off, (size_t)prefix_len * (size_t)hd * sizeof(float));
+                memcpy(pfx->v_cache + pfx_head_off, cur_sl->v_cache + slot_head_off, (size_t)prefix_len * (size_t)hd * sizeof(float));
+            }
+        }
+    }
+    pfx->prefix_len = prefix_len;
+    pfx->is_valid = 1;
+    return 1;
+}
+
+DPUF_EXPORT int32_t dpuf_engine_apply_prefix(void* handle, int32_t slot_id, int32_t pfx_id) {
+    DpufEngine* eng = (DpufEngine*)handle;
+    if (!eng || slot_id < 0 || slot_id >= eng->n_slots || pfx_id < 0 || pfx_id >= DPUF_MAX_PREFIXES) return 0;
+    DpufPrefixCache* pfx = &eng->prefixes[pfx_id];
+    if (!pfx->is_valid || pfx->prefix_len <= 0) return 0;
+
+    if (!eng->slots[slot_id].is_allocated) {
+        if (!slot_allocate(eng, slot_id)) return 0;
+    }
+    DpufKvSlot* dst_sl = &eng->slots[slot_id];
+
+    const int32_t n_layers = eng->cfg.num_layers;
+    const int32_t n_kv = eng->cfg.num_kv_heads;
+    const int32_t hd = eng->cfg.head_dim;
+    const int32_t hd_blk = (hd + 31) / 32;
+    const size_t head_stride = (size_t)eng->cfg.max_seq_len * (size_t)hd;
+    const size_t layer_kv_stride = (size_t)eng->cfg.max_seq_len * (size_t)n_kv * (size_t)hd;
+    const size_t scale_head_stride = (size_t)eng->cfg.max_seq_len * (size_t)hd_blk;
+    const int is_q8 = (eng->cfg.kv_type == DPUF_KV_Q8);
+    const int32_t prefix_len = pfx->prefix_len;
+
+    for (int32_t l = 0; l < n_layers; l++) {
+        for (int32_t kvh = 0; kvh < n_kv; kvh++) {
+            size_t pfx_head_off = ((size_t)l * (size_t)n_kv + (size_t)kvh) * (size_t)prefix_len * (size_t)hd;
+            size_t slot_head_off = (size_t)l * layer_kv_stride + (size_t)kvh * head_stride;
+
+            if (is_q8) {
+                memcpy(dst_sl->k_cache_q8 + slot_head_off, pfx->k_cache_q8 + pfx_head_off, (size_t)prefix_len * (size_t)hd * sizeof(int8_t));
+                memcpy(dst_sl->v_cache_q8 + slot_head_off, pfx->v_cache_q8 + pfx_head_off, (size_t)prefix_len * (size_t)hd * sizeof(int8_t));
+
+                size_t pfx_scale_off = ((size_t)l * (size_t)n_kv + (size_t)kvh) * (size_t)prefix_len * (size_t)hd_blk;
+                size_t slot_scale_off = ((size_t)l * (size_t)n_kv + (size_t)kvh) * scale_head_stride;
+                memcpy(dst_sl->k_scale_q8 + slot_scale_off, pfx->k_scale_q8 + pfx_scale_off, (size_t)prefix_len * (size_t)hd_blk * sizeof(float));
+                memcpy(dst_sl->v_scale_q8 + slot_scale_off, pfx->v_scale_q8 + pfx_scale_off, (size_t)prefix_len * (size_t)hd_blk * sizeof(float));
+            } else {
+                memcpy(dst_sl->k_cache + slot_head_off, pfx->k_cache + pfx_head_off, (size_t)prefix_len * (size_t)hd * sizeof(float));
+                memcpy(dst_sl->v_cache + slot_head_off, pfx->v_cache + pfx_head_off, (size_t)prefix_len * (size_t)hd * sizeof(float));
+            }
+        }
+    }
+    dst_sl->cur_pos = prefix_len;
+    return prefix_len;
+}
+
+DPUF_EXPORT int32_t dpuf_engine_get_prefix_len(void* handle, int32_t pfx_id) {
+    DpufEngine* eng = (DpufEngine*)handle;
+    if (!eng || pfx_id < 0 || pfx_id >= DPUF_MAX_PREFIXES) return 0;
+    return eng->prefixes[pfx_id].is_valid ? eng->prefixes[pfx_id].prefix_len : 0;
 }
 
 static void eng_compute_mrope_cos_sin(

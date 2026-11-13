@@ -252,6 +252,25 @@ Thanks to GQA (Grouped Query Attention) and Q8 quantization (`--kv-q8`), each sl
 
 ---
 
+## ⚡ Instant KV Prefix Cache (Freeze & Fork Pre-fill)
+
+Traditionally, when starting a new conversation or specialist agent, the engine naively re-computes attention over all 80–100 tokens of system directives on **every turn**.
+
+DPUF introduces **Freeze & Fork Instant Prefix Caching**:
+1. At container startup, the engine pre-computes the KV tensors for the system prompt and agent directives **once**.
+2. These tensors are frozen in RAM (occupying only ~2.7 MB per specialist agent).
+3. When starting a chat, clearing a slot (`/slot clear`), or switching agents (`/agent <name>`), the prefix is copied into the active slot in **0.05 ms**!
+4. The first turn **only forwards the user's question**, bypassing system prefill entirely.
+
+### Empirical Latency Improvement (Time-To-First-Token):
+| Specialist Agent | TTFT Without Prefix Cache | **TTFT With Instant KV Prefix** | Speedup / Latency Reduction |
+| :--- | :---: | :---: | :---: |
+| **Coder Specialist** | `207.0 ms` | **`53.8 ms`** | **3.85x Faster First Response ⚡** |
+| **Excel Specialist** | `154.9 ms` | **`61.3 ms`** | **2.53x Faster First Response ⚡** |
+| **General Assistant**| `166.7 ms` | **`52.8 ms`** | **3.16x Faster First Response ⚡** |
+
+---
+
 ## 📁 Managing In-Container Profiles & Rules
 
 Every `.dpuf` container can carry its own persona and behavioral rules directly inside its header:

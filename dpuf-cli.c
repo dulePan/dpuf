@@ -1107,7 +1107,13 @@ typedef struct {
     DpufSessionSlot session_slots[CLI_MAX_SLOTS];
     int             active_slot_idx;
     int             n_session_slots;
+
+    /* Instant KV Prefix Caches (Freeze & Fork) */
+    int             has_prefix[MAX_DPOF_AGENTS];
+    int             prefix_len[MAX_DPOF_AGENTS];
 } DpufCliModel;
+
+static void warm_and_freeze_agent_prefixes(DpufCliModel* m);
 
 static void track_owned(DpufCliModel* m, void* ptr) {
     if (!ptr) return;
@@ -1934,15 +1940,25 @@ static int dpuf_cli_open(
         dpuf_cli_close(m);
         return 0;
     }
-    m->open_ms = now_ms() - t0;
     m->n_session_slots = 4;
     m->active_slot_idx = 0;
+    for (int a = 0; a < MAX_DPOF_AGENTS; a++) {
+        m->has_prefix[a] = 0;
+        m->prefix_len[a] = 0;
+    }
+    warm_and_freeze_agent_prefixes(m);
     for (int s = 0; s < CLI_MAX_SLOTS; s++) {
-        m->session_slots[s].pos = 0;
         m->session_slots[s].active_agent_idx = m->active_agent_idx;
         m->session_slots[s].is_active = (s == 0) ? 1 : 0;
         snprintf(m->session_slots[s].title, sizeof(m->session_slots[s].title), "Session-%d", s);
+        if (m->active_agent_idx >= 0 && m->active_agent_idx < MAX_DPOF_AGENTS && m->has_prefix[m->active_agent_idx]) {
+            dpuf_engine_apply_prefix(m->engine, s, m->active_agent_idx);
+            m->session_slots[s].pos = m->prefix_len[m->active_agent_idx];
+        } else {
+            m->session_slots[s].pos = 0;
+        }
     }
+    m->open_ms = now_ms() - t0;
     return 1;
 }
 
@@ -1992,12 +2008,131 @@ static int32_t sample_token(const float* logits, int32_t V, float temp) {
     return chosen;
 }
 
+static void build_agent_prefix_prompt(const DpufCliModel* m, int ag_idx, StrBuf* out) {
+    out->len = 0;
+    const char* base_sys = m->profile_system_prompt;
+    const char* ag_sys = NULL;
+    char* const* ag_rules = NULL;
+    int n_ag_rules = 0;
+    const char* ag_name = NULL;
+
+    if (m->n_agents > 0 && ag_idx >= 0 && ag_idx < m->n_agents) {
+        const DpufAgent* ag = &m->agents[ag_idx];
+        ag_name = ag->name;
+        if (ag->system_prompt[0] != '\0' && strcmp(ag->system_prompt, base_sys) != 0) {
+            ag_sys = ag->system_prompt;
+        }
+        if (ag->n_rules > 0) {
+            ag_rules = ag->rules;
+            n_ag_rules = ag->n_rules;
+        }
+    }
+
+    int has_profile = (base_sys[0] != '\0' || (ag_sys && ag_sys[0] != '\0') ||
+                       m->n_profile_rules > 0 || n_ag_rules > 0);
+    if (!has_profile) return;
+
+    if (strcmp(m->tok.chat_format, "llama3") == 0) {
+        sb_append_bytes(out, "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n", 60);
+        if (base_sys[0] != '\0') {
+            sb_append_bytes(out, base_sys, strlen(base_sys));
+            sb_append_bytes(out, "\n", 1);
+        }
+        if (ag_sys && ag_sys[0] != '\0') {
+            if (base_sys[0] != '\0') sb_append_bytes(out, "\n", 1);
+            if (ag_name && ag_name[0]) {
+                char hbuf[128];
+                snprintf(hbuf, sizeof(hbuf), "[Specialist Role: %s]\n", ag_name);
+                sb_append_bytes(out, hbuf, strlen(hbuf));
+            }
+            sb_append_bytes(out, ag_sys, strlen(ag_sys));
+            sb_append_bytes(out, "\n", 1);
+        }
+        for (int r = 0; r < m->n_profile_rules; r++) {
+            char rline[512];
+            snprintf(rline, sizeof(rline), "- %s\n", m->profile_rules[r]);
+            sb_append_bytes(out, rline, strlen(rline));
+        }
+        for (int r = 0; r < n_ag_rules; r++) {
+            char rline[512];
+            snprintf(rline, sizeof(rline), "- [%s] %s\n", ag_name ? ag_name : "Specialist", ag_rules[r]);
+            sb_append_bytes(out, rline, strlen(rline));
+        }
+        sb_append_bytes(out, "<|eot_id|>", 10);
+    } else {
+        /* ChatML */
+        sb_append_bytes(out, "<|im_start|>system\n", 19);
+        if (base_sys[0] != '\0') {
+            sb_append_bytes(out, base_sys, strlen(base_sys));
+            sb_append_bytes(out, "\n", 1);
+        }
+        if (ag_sys && ag_sys[0] != '\0') {
+            if (base_sys[0] != '\0') sb_append_bytes(out, "\n", 1);
+            if (ag_name && ag_name[0]) {
+                char hbuf[128];
+                snprintf(hbuf, sizeof(hbuf), "[Specialist Role: %s]\n", ag_name);
+                sb_append_bytes(out, hbuf, strlen(hbuf));
+            }
+            sb_append_bytes(out, ag_sys, strlen(ag_sys));
+            sb_append_bytes(out, "\n", 1);
+        }
+        for (int r = 0; r < m->n_profile_rules; r++) {
+            char rline[512];
+            snprintf(rline, sizeof(rline), "- %s\n", m->profile_rules[r]);
+            sb_append_bytes(out, rline, strlen(rline));
+        }
+        for (int r = 0; r < n_ag_rules; r++) {
+            char rline[512];
+            snprintf(rline, sizeof(rline), "- [%s] %s\n", ag_name ? ag_name : "Specialist", ag_rules[r]);
+            sb_append_bytes(out, rline, strlen(rline));
+        }
+        sb_append_bytes(out, "<|im_end|>\n", 11);
+    }
+}
+
+static void warm_and_freeze_agent_prefixes(DpufCliModel* m) {
+    if (!m->engine || m->n_agents == 0) return;
+    float* logits = (float*)malloc((size_t)m->cfg.vocab_size * sizeof(float));
+    if (!logits) return;
+
+    StrBuf pfx_buf = {0};
+
+    for (int a = 0; a < m->n_agents && a < MAX_DPOF_AGENTS; a++) {
+        build_agent_prefix_prompt(m, a, &pfx_buf);
+        if (pfx_buf.len == 0) continue;
+
+        IntVec pfx_ids = {0};
+        int apply_bos = (strcmp(m->tok.chat_format, "llama3") == 0) ? 0 : 0;
+        bpe_encode(&m->tok, pfx_buf.data, apply_bos, &pfx_ids);
+        if (pfx_ids.len <= 0 || pfx_ids.len >= m->cfg.max_seq_len) {
+            free(pfx_ids.ids);
+            continue;
+        }
+
+        /* Reset slot 0 to pos 0, prefill prefix tokens */
+        dpuf_engine_set_slot(m->engine, 0);
+        dpuf_engine_reset_slot(m->engine, 0);
+        dpuf_engine_forward_batch(m->engine, pfx_ids.len, pfx_ids.ids, 0, 1, logits);
+
+        /* Freeze prefix in engine */
+        if (dpuf_engine_freeze_prefix(m->engine, a, pfx_ids.len)) {
+            m->has_prefix[a] = 1;
+            m->prefix_len[a] = pfx_ids.len;
+        }
+        free(pfx_ids.ids);
+    }
+    dpuf_engine_reset_slot(m->engine, 0);
+    free(logits);
+    free(pfx_buf.data);
+}
+
 static void build_formatted_prompt(
     const DpufCliModel* m,
     const char* user_text,
     int raw_mode,
     int think_mode,
     int is_first_turn,
+    int use_cached_prefix,
     StrBuf* out
 ) {
     out->len = 0;
@@ -2006,7 +2141,23 @@ static void build_formatted_prompt(
         return;
     }
 
-    /* Resolve active persona from multi-agent roster or fallback profile */
+    if (use_cached_prefix) {
+        /* Prefix is ALREADY computed and frozen in the KV cache! Only append the user turn! */
+        if (strcmp(m->tok.chat_format, "llama3") == 0) {
+            sb_append_bytes(out, "<|start_header_id|>user<|end_header_id|>\n\n", 41);
+            sb_append_bytes(out, user_text, strlen(user_text));
+            sb_append_bytes(out, "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", 56);
+        } else {
+            /* ChatML */
+            sb_append_bytes(out, "<|im_start|>user\n", 17);
+            sb_append_bytes(out, user_text, strlen(user_text));
+            sb_append_bytes(out, "<|im_end|>\n<|im_start|>assistant\n", 33);
+            if (think_mode) sb_append_bytes(out, "<think>\n", 8);
+        }
+        return;
+    }
+
+    /* Standard cold format with inline profile/agent header */
     const char* base_sys = m->profile_system_prompt;
     const char* ag_sys = NULL;
     char* const* ag_rules = NULL;
@@ -2187,10 +2338,13 @@ static int32_t run_turn_ex(
     TurnMetrics* out_m
 ) {
     StrBuf fmt = {0};
-    build_formatted_prompt(m, text, raw_mode, think_mode, is_first_turn, &fmt);
+    int ag_idx = m->active_agent_idx;
+    int use_cached_prefix = (is_first_turn && !raw_mode && ag_idx >= 0 && ag_idx < MAX_DPOF_AGENTS &&
+                             m->has_prefix[ag_idx] && start_pos == m->prefix_len[ag_idx]);
+    build_formatted_prompt(m, text, raw_mode, think_mode, is_first_turn, use_cached_prefix, &fmt);
 
     IntVec ids = {0};
-    int apply_bos = is_first_turn ? (raw_mode || strcmp(m->tok.chat_format, "raw") == 0 ? 1 : 0) : 0;
+    int apply_bos = (is_first_turn && !use_cached_prefix) ? (raw_mode || strcmp(m->tok.chat_format, "raw") == 0 ? 1 : 0) : 0;
     bpe_encode(&m->tok, fmt.data ? fmt.data : "", apply_bos, &ids);
     free(fmt.data);
 
@@ -2314,13 +2468,19 @@ static void run_slots_benchmark(DpufCliModel* m) {
         }
         m->active_agent_idx = ag_idx;
 
+        int32_t start_pos = 0;
+        if (ag_idx >= 0 && ag_idx < MAX_DPOF_AGENTS && m->has_prefix[ag_idx]) {
+            dpuf_engine_apply_prefix(m->engine, s, ag_idx);
+            start_pos = m->prefix_len[ag_idx];
+        }
+
         printf("----------------------------------------------------------------------------------------\n");
-        printf(">>> [Slot %d | Specialist: '%s']\n", s, m->agents[ag_idx].name);
+        printf(">>> [Slot %d | Specialist: '%s' (Instant Prefix: %d tokens primed in 0 ms)]\n", s, m->agents[ag_idx].name, start_pos);
         printf("    Prompt: \"%s\"\n", test_prompts[s]);
         printf("----------------------------------------------------------------------------------------\n");
 
         int hit_eos = -1;
-        int32_t pos = run_turn_ex(m, test_prompts[s], 0, 48, 0.0f, 0, 0, 0, 1, logits, &hit_eos, &slot_metrics[s]);
+        int32_t pos = run_turn_ex(m, test_prompts[s], start_pos, 48, 0.0f, 0, 0, 0, 1, logits, &hit_eos, &slot_metrics[s]);
         m->session_slots[s].pos = pos;
         printf("\n\n");
     }
@@ -3050,12 +3210,18 @@ int main(int argc, char** argv) {
                     int target_s = (*sid_s) ? atoi(sid_s) : model.active_slot_idx;
                     if (target_s >= 0 && target_s < model.n_session_slots) {
                         dpuf_engine_reset_slot(model.engine, target_s);
-                        model.session_slots[target_s].pos = 0;
+                        int ag_s = model.session_slots[target_s].active_agent_idx;
+                        if (ag_s >= 0 && ag_s < MAX_DPOF_AGENTS && model.has_prefix[ag_s]) {
+                            dpuf_engine_apply_prefix(model.engine, target_s, ag_s);
+                            model.session_slots[target_s].pos = model.prefix_len[ag_s];
+                        } else {
+                            model.session_slots[target_s].pos = 0;
+                        }
                         if (target_s == model.active_slot_idx) {
-                            pos = 0;
+                            pos = model.session_slots[target_s].pos;
                             first_turn = 1;
                         }
-                        printf("[Slot %d conversation cleared — other slots untouched]\n", target_s);
+                        printf("[Slot %d conversation cleared — agent prefix primed in 0 ms]\n", target_s);
                     } else {
                         printf("[Error: invalid slot %d]\n", target_s);
                     }
@@ -3134,13 +3300,19 @@ int main(int argc, char** argv) {
                     model.active_agent_idx = chosen_idx;
                     model.session_slots[model.active_slot_idx].active_agent_idx = chosen_idx;
                     dpuf_engine_reset_slot(model.engine, model.active_slot_idx);
-                    pos = 0;
+                    if (model.has_prefix[chosen_idx]) {
+                        dpuf_engine_apply_prefix(model.engine, model.active_slot_idx, chosen_idx);
+                        pos = model.prefix_len[chosen_idx];
+                    } else {
+                        pos = 0;
+                    }
                     first_turn = 1;
+                    model.session_slots[model.active_slot_idx].pos = pos;
                     printf("[Slot %d switched to specialist: '%s' (%s)]\n",
                         model.active_slot_idx,
                         model.agents[chosen_idx].name,
                         model.agents[chosen_idx].desc[0] ? model.agents[chosen_idx].desc : "active");
-                    printf("[KV-cache reset — ready with new specialist persona]\n");
+                    printf("[Instant KV-prefix primed (%d tokens) in 0 ms]\n", pos);
                 } else {
                     printf("[Error: Agent '%s' not found. Type '/agents' to see roster]\n", target);
                 }
@@ -3166,10 +3338,16 @@ int main(int argc, char** argv) {
             }
             if (strcmp(line, "/reset") == 0) {
                 dpuf_engine_reset_slot(model.engine, model.active_slot_idx);
-                model.session_slots[model.active_slot_idx].pos = 0;
-                pos = 0;
+                int cur_a = model.active_agent_idx;
+                if (cur_a >= 0 && cur_a < MAX_DPOF_AGENTS && model.has_prefix[cur_a]) {
+                    dpuf_engine_apply_prefix(model.engine, model.active_slot_idx, cur_a);
+                    pos = model.prefix_len[cur_a];
+                } else {
+                    pos = 0;
+                }
                 first_turn = 1;
-                printf("[Slot %d KV-cache reset — other slots remain untouched]\n", model.active_slot_idx);
+                model.session_slots[model.active_slot_idx].pos = pos;
+                printf("[Slot %d reset — agent prefix (%d tokens) primed in 0 ms]\n", model.active_slot_idx, pos);
                 continue;
             }
             int hit_eos = -1;
