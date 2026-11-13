@@ -154,6 +154,33 @@ python dpuf_profile.py del-agent model.dpuf excel
 
 ---
 
+## 🔄 Universal Model Importer (`dpuf_import.py`)
+
+DPUF includes an all-in-one universal importer that converts models from **GGUF** and **HuggingFace** directly into ultra-fast `.dpuf` containers:
+
+### 1. Import from GGUF (.gguf)
+Automatically dequantizes any GGUF quantization (Q4_K_M, Q4_0, Q8_0, BF16, FP16) and encodes it into Hadamard-4bit (`mode 12`):
+```bash
+# Convert any GGUF model:
+python dpuf_import.py Qwen3-8B-Q4_K_M.gguf -o Qwen3-8B.dpuf --mode had4p
+
+# Convert with custom rules embedded inside:
+python dpuf_import.py Llama-3.2-1B-Instruct.gguf -o Llama-3.2-1B.dpuf \
+  --rule "Respond in concise markdown." \
+  --rule "Answer in the user's language."
+```
+
+### 2. Import from HuggingFace (SafeTensors Directory or Hub)
+```bash
+# Local directory:
+python dpuf_import.py ./models/Qwen3-0.6B -o Qwen3-0.6B.dpuf
+
+# Stream directly from HuggingFace Hub:
+python dpuf_import.py Qwen/Qwen2.5-0.5B-Instruct -o Qwen2.5-0.5B.dpuf
+```
+
+---
+
 ## 🛠️ Building & Cross-Platform Compilation
 
 DPUF is written in strictly standard, high-performance C (C11) with zero runtime dependencies. It compiles natively on Windows and Linux x86_64:
