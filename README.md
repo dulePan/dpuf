@@ -154,6 +154,33 @@ python dpuf_profile.py del-agent model.dpuf excel
 
 ---
 
+## 🛠️ Building & Cross-Platform Compilation
+
+DPUF is written in strictly standard, high-performance C (C11) with zero runtime dependencies. It compiles natively on Windows and Linux x86_64:
+
+### Windows (MSVC)
+```cmd
+build_kernel.cmd
+:: Produces dpuf-cli.exe and dpuf_avx2.dll with AVX2 + OpenMP
+```
+
+### Linux (Ubuntu, Debian, Fedora, Arch, Alpine)
+Requires `gcc` (or `clang`), `make`, and OpenMP:
+```bash
+# 1. Install build tools if needed
+sudo apt install build-essential    # On Debian / Ubuntu
+sudo dnf install gcc make          # On Fedora / RHEL
+
+# 2. Build via script or make
+./build_linux.sh
+# (or simply: make)
+
+# 3. Run interactive chat
+./dpuf-cli -m model.dpuf -i
+```
+
+---
+
 ## 🗂️ Multi-Session Slots: Multiple Independent Chats in One Model
 
 DPUF allows running multiple independent conversation sessions (**slots**) inside the same model in RAM simultaneously with **zero cross-talk and zero reloading overhead (0 ms)**:

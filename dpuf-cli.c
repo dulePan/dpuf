@@ -12,15 +12,28 @@
  */
 
 #define _CRT_SECURE_NO_WARNINGS
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <time.h>
+#include <strings.h>
+#endif
 #include <ctype.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef MAX_PATH
+#define MAX_PATH 1024
+#endif
 
 #include "dpuf_kernels.h"
 #include "dpuf_vision.h"
@@ -93,11 +106,17 @@ static uint32_t cli_crc32(const uint8_t* data, size_t len) {
 }
 
 static double now_ms(void) {
+#ifdef _WIN32
     static LARGE_INTEGER freq = {0};
     LARGE_INTEGER cnt;
     if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&cnt);
     return (double)cnt.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
 }
 
 static float bf16_to_f32(uint16_t b) {
@@ -108,14 +127,19 @@ static float bf16_to_f32(uint16_t b) {
 }
 
 typedef struct {
+#ifdef _WIN32
     HANDLE   hFile;
     HANDLE   hMap;
+#else
+    int      fd;
+#endif
     uint8_t* base;
     uint64_t size;
 } MmapView;
 
 static int map_file_ro(const char* path, MmapView* mv) {
     memset(mv, 0, sizeof(*mv));
+#ifdef _WIN32
     mv->hFile = CreateFileA(
         path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
     );
@@ -144,12 +168,42 @@ static int map_file_ro(const char* path, MmapView* mv) {
         return 0;
     }
     return 1;
+#else
+    mv->fd = open(path, O_RDONLY);
+    if (mv->fd < 0) return 0;
+
+    struct stat st;
+    if (fstat(mv->fd, &st) < 0 || (uint64_t)st.st_size < sizeof(DpufFileTopHdr)) {
+        close(mv->fd);
+        mv->fd = -1;
+        return 0;
+    }
+    mv->size = (uint64_t)st.st_size;
+
+    void* ptr = mmap(NULL, (size_t)mv->size, PROT_READ, MAP_SHARED, mv->fd, 0);
+    if (ptr == MAP_FAILED) {
+        close(mv->fd);
+        mv->fd = -1;
+        return 0;
+    }
+    mv->base = (uint8_t*)ptr;
+    return 1;
+#endif
 }
 
 static void unmap_file_ro(MmapView* mv) {
+#ifdef _WIN32
     if (mv->base) UnmapViewOfFile(mv->base);
     if (mv->hMap) CloseHandle(mv->hMap);
     if (mv->hFile && mv->hFile != INVALID_HANDLE_VALUE) CloseHandle(mv->hFile);
+#else
+    if (mv->base && mv->base != MAP_FAILED) {
+        munmap(mv->base, (size_t)mv->size);
+    }
+    if (mv->fd >= 0) {
+        close(mv->fd);
+    }
+#endif
     memset(mv, 0, sizeof(*mv));
 }
 
@@ -1953,32 +2007,57 @@ static void build_formatted_prompt(
     }
 
     /* Resolve active persona from multi-agent roster or fallback profile */
-    const char* active_sys = m->profile_system_prompt;
-    char* const* active_rules = m->profile_rules;
-    int n_active_rules = m->n_profile_rules;
+    const char* base_sys = m->profile_system_prompt;
+    const char* ag_sys = NULL;
+    char* const* ag_rules = NULL;
+    int n_ag_rules = 0;
+    const char* ag_name = NULL;
 
     if (m->n_agents > 0 && m->active_agent_idx >= 0 && m->active_agent_idx < m->n_agents) {
         const DpufAgent* ag = &m->agents[m->active_agent_idx];
-        if (ag->system_prompt[0] != '\0') active_sys = ag->system_prompt;
+        ag_name = ag->name;
+        if (ag->system_prompt[0] != '\0' && strcmp(ag->system_prompt, base_sys) != 0) {
+            ag_sys = ag->system_prompt;
+        }
         if (ag->n_rules > 0) {
-            active_rules = ag->rules;
-            n_active_rules = ag->n_rules;
+            ag_rules = ag->rules;
+            n_ag_rules = ag->n_rules;
         }
     }
 
-    int has_profile = (active_sys[0] != '\0' || n_active_rules > 0);
+    int has_profile = (base_sys[0] != '\0' || (ag_sys && ag_sys[0] != '\0') ||
+                       m->n_profile_rules > 0 || n_ag_rules > 0);
     if (strcmp(m->tok.chat_format, "llama3") == 0) {
         if (is_first_turn) {
             sb_append_bytes(out, "<|begin_of_text|>", 17);
             if (has_profile) {
                 sb_append_bytes(out, "<|start_header_id|>system<|end_header_id|>\n\n", 43);
-                if (active_sys[0] != '\0') {
-                    sb_append_bytes(out, active_sys, strlen(active_sys));
+                /* 1. Global / Base System Prompt */
+                if (base_sys[0] != '\0') {
+                    sb_append_bytes(out, base_sys, strlen(base_sys));
                     sb_append_bytes(out, "\n", 1);
                 }
-                for (int r = 0; r < n_active_rules; r++) {
+                /* 2. Specialist Agent Persona */
+                if (ag_sys && ag_sys[0] != '\0') {
+                    if (base_sys[0] != '\0') sb_append_bytes(out, "\n", 1);
+                    if (ag_name && ag_name[0]) {
+                        char hbuf[128];
+                        snprintf(hbuf, sizeof(hbuf), "[Specialist Role: %s]\n", ag_name);
+                        sb_append_bytes(out, hbuf, strlen(hbuf));
+                    }
+                    sb_append_bytes(out, ag_sys, strlen(ag_sys));
+                    sb_append_bytes(out, "\n", 1);
+                }
+                /* 3. Global / Base Rules */
+                for (int r = 0; r < m->n_profile_rules; r++) {
                     char rline[512];
-                    snprintf(rline, sizeof(rline), "- %s\n", active_rules[r]);
+                    snprintf(rline, sizeof(rline), "- %s\n", m->profile_rules[r]);
+                    sb_append_bytes(out, rline, strlen(rline));
+                }
+                /* 4. Specialist Agent Rules */
+                for (int r = 0; r < n_ag_rules; r++) {
+                    char rline[512];
+                    snprintf(rline, sizeof(rline), "- [%s] %s\n", ag_name ? ag_name : "Specialist", ag_rules[r]);
                     sb_append_bytes(out, rline, strlen(rline));
                 }
                 sb_append_bytes(out, "<|eot_id|>", 10);
@@ -1991,13 +2070,32 @@ static void build_formatted_prompt(
         /* ChatML (Qwen3) */
         if (is_first_turn && has_profile) {
             sb_append_bytes(out, "<|im_start|>system\n", 19);
-            if (active_sys[0] != '\0') {
-                sb_append_bytes(out, active_sys, strlen(active_sys));
+            /* 1. Global / Base System Prompt */
+            if (base_sys[0] != '\0') {
+                sb_append_bytes(out, base_sys, strlen(base_sys));
                 sb_append_bytes(out, "\n", 1);
             }
-            for (int r = 0; r < n_active_rules; r++) {
+            /* 2. Specialist Agent Persona */
+            if (ag_sys && ag_sys[0] != '\0') {
+                if (base_sys[0] != '\0') sb_append_bytes(out, "\n", 1);
+                if (ag_name && ag_name[0]) {
+                    char hbuf[128];
+                    snprintf(hbuf, sizeof(hbuf), "[Specialist Role: %s]\n", ag_name);
+                    sb_append_bytes(out, hbuf, strlen(hbuf));
+                }
+                sb_append_bytes(out, ag_sys, strlen(ag_sys));
+                sb_append_bytes(out, "\n", 1);
+            }
+            /* 3. Global / Base Rules */
+            for (int r = 0; r < m->n_profile_rules; r++) {
                 char rline[512];
-                snprintf(rline, sizeof(rline), "- %s\n", active_rules[r]);
+                snprintf(rline, sizeof(rline), "- %s\n", m->profile_rules[r]);
+                sb_append_bytes(out, rline, strlen(rline));
+            }
+            /* 4. Specialist Agent Rules */
+            for (int r = 0; r < n_ag_rules; r++) {
+                char rline[512];
+                snprintf(rline, sizeof(rline), "- [%s] %s\n", ag_name ? ag_name : "Specialist", ag_rules[r]);
                 sb_append_bytes(out, rline, strlen(rline));
             }
             sb_append_bytes(out, "<|im_end|>\n", 11);
@@ -2508,6 +2606,27 @@ static void print_usage(const char* prog) {
     printf("  --bench         Run tg64 / pp32 / pp256 throughput benchmark\n");
 }
 
+#ifndef _WIN32
+static void scan_dir_for_dpuf(const char* dir_path, char found_paths[16][MAX_PATH], uint64_t found_sizes[16], int* n_found) {
+    DIR* d = opendir(dir_path);
+    if (!d) return;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL && *n_found < 16) {
+        size_t len = strlen(de->d_name);
+        if (len > 5 && strcmp(de->d_name + len - 5, ".dpuf") == 0) {
+            char full[MAX_PATH];
+            snprintf(full, sizeof(full), "%s/%s", dir_path, de->d_name);
+            struct stat st;
+            if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
+                snprintf(found_paths[*n_found], MAX_PATH, "%s", full);
+                found_sizes[(*n_found)++] = (uint64_t)st.st_size;
+            }
+        }
+    }
+    closedir(d);
+}
+#endif
+
 static int resolve_or_select_model(const char* requested, char* out_path, size_t max_out) {
     if (requested && requested[0]) {
         snprintf(out_path, max_out, "%s", requested);
@@ -2572,6 +2691,24 @@ static int resolve_or_select_model(const char* requested, char* out_path, size_t
             } while (FindNextFileA(hFind, &fd) && n_found < 16);
             FindClose(hFind);
         }
+    }
+#else
+    /* 1. POSIX: Search current directory */
+    scan_dir_for_dpuf(".", found_paths, found_sizes, &n_found);
+
+    /* 2. Search $HOME/.dpuf/models/ */
+    if (n_found == 0) {
+        const char* home = getenv("HOME");
+        if (home && home[0]) {
+            char search_dir[MAX_PATH];
+            snprintf(search_dir, sizeof(search_dir), "%s/.dpuf/models", home);
+            scan_dir_for_dpuf(search_dir, found_paths, found_sizes, &n_found);
+        }
+    }
+
+    /* 3. Developer fallback: check real_models/dpuf/ */
+    if (n_found == 0) {
+        scan_dir_for_dpuf("real_models/dpuf", found_paths, found_sizes, &n_found);
     }
 #endif
 

@@ -15,11 +15,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <immintrin.h>
+#ifdef _MSC_VER
 #include <intrin.h>
+#endif
 #include <omp.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <sched.h>
 #endif
 
 #include "dpuf_kernels.h"
@@ -42,8 +46,8 @@ static __forceinline float eng_hsum256_ps(__m256 v) {
 }
 
 typedef struct {
-    __declspec(align(64)) volatile long arrived;
-    __declspec(align(64)) volatile long sense;
+    DPUF_ALIGN(64) volatile long arrived;
+    DPUF_ALIGN(64) volatile long sense;
 } DpufSpinBarrier;
 
 static __forceinline void engine_barrier(DpufSpinBarrier* bar, int32_t n_threads, int32_t* local_sense) {
@@ -68,8 +72,22 @@ static __forceinline void engine_barrier(DpufSpinBarrier* bar, int32_t n_threads
         }
     }
 #else
-    (void)bar;
-    #pragma omp barrier
+    __sync_synchronize();
+    long prev = __sync_add_and_fetch(&bar->arrived, 1);
+    if (prev == n_threads) {
+        bar->arrived = 0;
+        __sync_synchronize();
+        bar->sense = my_sense;
+    } else {
+        uint32_t spins = 0;
+        while (bar->sense != my_sense) {
+            _mm_pause();
+            if (++spins > 32768u) {
+                sched_yield();
+                spins = 0;
+            }
+        }
+    }
 #endif
 }
 

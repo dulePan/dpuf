@@ -3,10 +3,27 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
+#ifdef _MSC_VER
 #define DPUF_EXPORT __declspec(dllexport)
+#define DPUF_ALIGN(n) __declspec(align(n))
 #else
 #define DPUF_EXPORT __attribute__((visibility("default")))
+#define DPUF_ALIGN(n) __attribute__((aligned(n)))
+#ifndef __forceinline
+#define __forceinline static inline __attribute__((always_inline))
+#endif
+#ifndef _strdup
+#define _strdup strdup
+#endif
+#ifndef _stricmp
+#define _stricmp strcasecmp
+#endif
+#ifndef align
+#define align(n) aligned(n)
+#endif
+#ifndef __declspec
+#define __declspec(x) __attribute__((x))
+#endif
 #endif
 
 enum {
