@@ -1,0 +1,52 @@
+# DPUF Community & Enterprise Commercial License
+
+Copyright (c) 2026 D. P. (dule_pan). All Rights Reserved.
+
+## License Overview
+The **DPUF (Dual-Precision Unified Format)** container specification, Zero-Decode AVX2/FMA/OpenMP C inference engine (`dpuf_engine.c`, `dpuf_avx2.c`, `dpuf-cli`), and associated profiling/quantization tools are licensed under a **Dual Community & Enterprise Commercial License**:
+
+1. **Free for Academic, Research & Personal Local Use (Unlimited):**
+   - Free forever for universities, students, individual researchers, non-profit academic research, and personal hobbyist evaluation on local hardware.
+2. **Commercial & Platform Licensing Required:**
+   - Any commercial entity, funded startup, or enterprise that monetizes, deploys in proprietary production systems, serves through paid commercial APIs, or embeds DPUF and its execution mechanics into a commercial platform/application (including but not limited to distribution via multi-model serving platforms, model execution runners, or cloud-hosted AI inference providers) **must obtain a written Commercial Enterprise License from the author (D. P. / dule_pan) prior to distribution or commercial use**.
+
+---
+
+## Terms and Conditions
+
+### 1. Definitions
+- **"Software"** means the DPUF binary format specification, reference encoders, C AVX2 Zero-Decode runtime engine, living container profiler, and all associated code in this repository.
+- **"Commercial Use"** means any use, deployment, or integration of the Software for direct or indirect commercial advantage, monetary compensation, revenue generation, or incorporation into commercial software, SaaS platforms, or proprietary internal enterprise workloads.
+- **"Platform Embedding"** means integrating, packaging, wrapping, or redistributing the Software, format decoder, or kernels as a component of a multi-model serving platform, local AI manager, or developer tool distributed to third parties.
+
+### 2. Permitted Free Uses (No License Fee)
+Subject to Section 4 (Attribution and Notice):
+- **Academic & Scientific Research:** You may freely inspect, modify, evaluate, and publish academic research utilizing DPUF at any scale without charge.
+- **Personal & Local Development:** Individual developers, students, and hobbyists may freely build, test, and run models locally for non-commercial personal projects.
+- **Open-Source Non-Commercial Tooling:** Purely open-source tools with no commercial monetization, paid tiers, or outside venture funding may interface with DPUF.
+
+### 3. Commercial & Enterprise Licensing Requirement
+If you intend to use, integrate, or redistribute the Software for:
+- Production deployment within a commercial business, enterprise, or government entity;
+- Providing a paid API, cloud inference service, or hosted LLM backend;
+- Embedding DPUF support within a commercial software application, developer platform, or multi-model management runner;
+- Closed-source redistribution;
+
+You **do not** receive a grant under Section 2. You must contact **D. P. (dule_pan)** to purchase and execute a valid **DPUF Enterprise Commercial License Agreement**.
+
+### 4. Attribution and Container Notice Preservation
+For all permitted redistributions and implementations:
+- The original copyright notice (`Copyright (c) 2026 D. P. (dule_pan)`) must be retained in all source files, documentation, and binary releases.
+- The format identity (`DPUF` / `DPUF0001`), author metadata, and cryptographic checksums embedded in `.dpuf` container headers must remain intact and unmodified.
+
+### 5. Disclaimer of Warranty
+THE SOFTWARE AND SPECIFICATION ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+### Commercial Licensing & Inquiries
+For commercial licensing, enterprise source access, hardware vendor optimizations, or custom kernel engineering, please contact:
+- **Author:** D. P. (`dule_pan`)  
+- **Contact Email:** `perkindusan@gmail.com`  
+- **GitHub Profile:** [https://github.com/dulePan](https://github.com/dulePan)  
+- **Repository:** [https://github.com/dulePan/dpuf](https://github.com/dulePan/dpuf)

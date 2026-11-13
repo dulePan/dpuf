@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+*.dpuf
+*.lrflac
+*.safetensors
+*.part
+*.dll
+*.so
+*.dylib
+*.lib
+*.exp
+*.obj
+*.exe
